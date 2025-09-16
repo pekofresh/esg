@@ -12,7 +12,7 @@ import time
 import logging
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import Any, Sequence, Tuple
+from typing import Any, Sequence, Tuple, Optional, Union, Callable, Dict
 
 import numpy as np
 import pandas as pd
@@ -250,127 +250,179 @@ def _load_refinitiv(
 
     return df_out
 
+logger = logging.getLogger(__name__)
 @log_timing
-def _load_ids_portfolio(sDate: list[str], sLeftOn: str) -> pd.DataFrame:
-    """Load IDS portfolio holdings for the provided dates."""
+# -----------------------------------------------------------------------------
+# SQL helpers
+# -----------------------------------------------------------------------------
+def _build_in_clause(values: Sequence[Any], prefix: str = "param") -> tuple[str, dict[str, Any]]:
+    """
+    Build a safe SQL IN clause with parameter placeholders.
 
-    date_clause, date_params = _build_in_clause(sDate)
-    fund_ids = [40002847, 40011162, 40002955, 40002956]
-    fund_clause, fund_params = _build_in_clause(fund_ids)
+    Args:
+        values: Values to include in the IN clause.
+        prefix: Prefix for parameter names.
+
+    Returns:
+        A tuple (clause, params), where:
+          - clause is a SQL string like "( :param0, :param1 )"
+          - params is a dict mapping placeholders to values
+    """
+    if not values:
+        raise ValueError("IN clause values must not be empty.")
+
+    clause_parts = []
+    params: dict[str, Any] = {}
+    for i, val in enumerate(values):
+        key = f"{prefix}{i}"
+        clause_parts.append(f":{key}")
+        params[key] = val
+
+    return f"({', '.join(clause_parts)})", params
+
+
+def build_ids_portfolio_sql(
+    ids_holdings_table: str,
+    ids_fund_table: str,
+    dates: Sequence[str],
+    fund_ids: Sequence[int],
+) -> tuple[str, dict[str, Any]]:
+    """Return SQL query and bound params for IDS portfolio holdings."""
+    date_clause, date_params = _build_in_clause(dates, prefix="date")
+    fund_clause, fund_params = _build_in_clause(fund_ids, prefix="fund")
 
     sql = f"""
-    SELECT a.edm_fund_id as portfolio_id,
-           100 as benchmark_id,
-           b.fund_name as portfolio_name,
-           INSTRUMENT_IDENTIFIER as id_isin,
-           INSTRUMENT_WEIGHT_IN_FUND as weight,
-           VALIDITY_DATE as effective_date,
-           validity_date
-    FROM {CONFIG.ids_holdings_table} a
-    LEFT JOIN (
-        SELECT DISTINCT edm_fund_id, fund_name
-        FROM {CONFIG.ids_fund_table}
-        WHERE edm_fund_id IN {fund_clause}
-    ) b ON a.edm_fund_id = b.edm_fund_id
-    WHERE CAST(a.validity_date AS DATE) IN {date_clause}
-      AND a.edm_fund_id IN {fund_clause}
+        SELECT a.edm_fund_id AS portfolio_id,
+               :benchmark_id AS benchmark_id,
+               b.fund_name AS portfolio_name,
+               a.instrument_identifier AS id_isin,
+               a.instrument_weight_in_fund AS weight,
+               CAST(a.validity_date AS DATE) AS effective_date
+        FROM {ids_holdings_table} a
+        LEFT JOIN (
+            SELECT DISTINCT edm_fund_id, fund_name
+            FROM {ids_fund_table}
+            WHERE edm_fund_id IN {fund_clause}
+        ) b
+          ON a.edm_fund_id = b.edm_fund_id
+        WHERE CAST(a.validity_date AS DATE) IN {date_clause}
+          AND a.edm_fund_id IN {fund_clause}
     """
-    params = date_params + fund_params + fund_params
-    logger.debug("Executing IDS portfolio SQL", extra={"sql": sql})
-    dfPf = pd.read_sql(sql, lib_utils.conndremio, params=params)
 
-    dfPf["durable_key_type"] = "xls"
-    dfPf["portfolio_type"] = "Fund"
-    dfPf = pd.merge(
-        dfPf,
-        lib_utils.dfSecurities,
+    params = {**date_params, **fund_params}
+    return sql, params
+
+
+# -----------------------------------------------------------------------------
+# DataFrame enrichments & normalizers
+# -----------------------------------------------------------------------------
+def normalize_company_ids(df: pd.DataFrame) -> pd.DataFrame:
+    """Ensure Bloomberg company IDs are numeric floats."""
+    for col in ["ID_BB_COMPANY", "ID_BB_PARENT_CO", "ID_BB_ULTIMATE_PARENT_CO"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
+def enrich_with_securities(df: pd.DataFrame, df_securities: pd.DataFrame, join_key: str) -> pd.DataFrame:
+    """Join securities reference metadata to holdings."""
+    return df.merge(
+        df_securities,
         how="left",
-        left_on=sLeftOn,
+        left_on=join_key,
         right_on="ID_ISIN",
         validate="m:1",
     )
 
-    dfPf["ID_BB_COMPANY"] = dfPf["ID_BB_COMPANY"].astype(float)
-    dfPf["ID_BB_PARENT_CO"] = dfPf["ID_BB_PARENT_CO"].astype(float)
-    dfPf["ID_BB_ULTIMATE_PARENT_CO"] = dfPf["ID_BB_ULTIMATE_PARENT_CO"].astype(float)
 
-    dfPf["issuer_long_name"] = dfPf["LONG_COMP_NAME"]
-    dfPf["long_name"] = dfPf["SECURITY_DES"]
-    dfPf["gics_sector_description"] = dfPf["INDUSTRY_SECTOR"].str.upper()
-
-    dfPf = pd.merge(
-        dfPf,
-        lib_utils.dfCountry,
+def enrich_with_countries(df: pd.DataFrame, df_country: pd.DataFrame) -> pd.DataFrame:
+    """Join country reference metadata to holdings."""
+    out = df.merge(
+        df_country,
         how="left",
         left_on="ULT_PARENT_CNTRY_DOMICILE",
         right_on="country_code",
         validate="m:1",
     )
-    dfPf["country_issue_name"] = dfPf["country_name"]
+    out["country_issue_name"] = out.get("country_name")
+    return out
 
-    return dfPf
 
-@log_timing
-def load_IDS(sDate: list[str], iRefresh: bool) -> pd.DataFrame:
-    """Load IDS fund holdings and optionally refresh the cache."""
+def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Standardize common descriptive columns."""
+    if "LONG_COMP_NAME" in df:
+        df["issuer_long_name"] = df["LONG_COMP_NAME"]
+    if "SECURITY_DES" in df:
+        df["long_name"] = df["SECURITY_DES"]
+    if "INDUSTRY_SECTOR" in df:
+        df["gics_sector_description"] = df["INDUSTRY_SECTOR"].str.upper()
+    return df
 
-    logger.info("Loading IDS fund holdings...")
-    date_clause, date_params = _build_in_clause(sDate)
 
-    if iRefresh:
-        sql = f"""
-        SELECT VALIDITY_DATE as effective_date,
-               FUND_IDENTIFIER as portfolio_id,
-               INSTRUMENT_IDENTIFIER as id_isin,
-               BBG_COMPANY_ID as ID_BB_COMPANY,
-               INSTRUMENT_NAME as long_name,
-               INSTRUMENT_ASSET_CLASS as agi_instrument_asset_type_description,
-               INSTRUMENT_WEIGHT_IN_FUND as weight
-        FROM {CONFIG.ids_holdings_table}
-        WHERE FUND_IDENTIFIER IS NOT NULL
-          AND CAST(VALIDITY_DATE AS DATE) IN {date_clause}
-        """
-        logger.debug("Executing IDS holdings SQL", extra={"sql": sql})
-        dfHoldings = pd.read_sql(sql, lib_utils.conndremio, params=date_params)
-        dfHoldings = pd.merge(
-            dfHoldings,
-            lib_utils.dfHierarchy,
-            how="left",
-            on="ID_BB_COMPANY",
-            validate="m:1",
-        )
+# -----------------------------------------------------------------------------
+# Main loader
+# -----------------------------------------------------------------------------
+def load_ids_portfolio(
+    dates: Sequence[str],
+    join_key: str,
+    conn: Connection,
+    ids_holdings_table: str,
+    ids_fund_table: str,
+    df_securities: pd.DataFrame,
+    df_country: pd.DataFrame,
+    benchmark_id: int = 100,
+    fund_ids: Sequence[int] = (40002847, 40011162, 40002955, 40002956),
+) -> pd.DataFrame:
+    """
+    Load IDS portfolio holdings for the given dates and enrich with securities and country data.
 
-        dfHoldings["gics_sector_description"] = dfHoldings["INDUSTRY_SECTOR"]
+    Args:
+        dates: One or more validity dates ("YYYY-MM-DD").
+        join_key: Column name in holdings to merge with securities (typically "id_isin").
+        conn: SQLAlchemy connection to Dremio/warehouse.
+        ids_holdings_table: Fully qualified name of the IDS holdings table.
+        ids_fund_table: Fully qualified name of the IDS fund metadata table.
+        df_securities: Preloaded securities reference DataFrame.
+        df_country: Preloaded country reference DataFrame.
+        benchmark_id: Benchmark ID to attach to all rows (default=100).
+        fund_ids: Restrict query to these fund IDs.
 
-        dfHoldings["issuer_long_name"] = dfHoldings["LONG_COMP_NAME"]
-        dfHoldings["country_issue_name"] = dfHoldings["ULT_PARENT_CNTRY_DOMICILE"]
+    Returns:
+        A pandas DataFrame with holdings enriched with security and country metadata.
 
-        sql = f"""
-            SELECT DISTINCT FUND_IDENTIFIER as portfolio_id,
-                            FUND_NAME as portfolio_name,
-                            FUND_TYPE as portfolio_type
-            FROM {CONFIG.ids_fund_table}
-            WHERE FUND_IDENTIFIER IS NOT NULL
-              AND CAST(VALIDITY_DATE AS DATE) IN {date_clause}
-        """
-        dfFundNames = pd.read_sql(sql, lib_utils.conndremio, params=date_params)
+    Raises:
+        ValueError: If dates or fund_ids are empty.
+    """
+    if not dates:
+        raise ValueError("Parameter 'dates' must not be empty.")
+    if not fund_ids:
+        raise ValueError("Parameter 'fund_ids' must not be empty.")
 
-        dfHoldings = pd.merge(
-            dfHoldings,
-            dfFundNames,
-            how="left",
-            on="portfolio_id",
-            validate="m:1",
-        )
-        dfHoldings["portfolio_type"] = dfHoldings["portfolio_type"].map(
-            {"EF": "External Target Fund", "F": "Internal Target Fund"}
-        )
+    sql, params = build_ids_portfolio_sql(ids_holdings_table, ids_fund_table, dates, fund_ids)
+    params["benchmark_id"] = benchmark_id
 
-        dfHoldings.to_pickle(CONFIG.target_funds_cache_pickle)
-    else:
-        dfHoldings = pd.read_pickle(CONFIG.target_funds_cache_pickle)
+    logger.info(
+        "Loading IDS portfolio holdings",
+        extra={"dates": dates, "fund_ids": fund_ids, "benchmark_id": benchmark_id},
+    )
 
-    return dfHoldings
+    df = pd.read_sql(sql, conn, params=params)
+
+    # Enrichment pipeline
+    df["durable_key_type"] = "xls"
+    df["portfolio_type"] = "Fund"
+
+    df = (
+        df.pipe(enrich_with_securities, df_securities, join_key)
+          .pipe(normalize_company_ids)
+          .pipe(standardize_columns)
+          .pipe(enrich_with_countries, df_country)
+    )
+
+    return df
+
+
+
 
 def save_cache(df_pandas, path, spark, format='parquet'):
     """
@@ -431,51 +483,114 @@ def load_cache(path, spark, format='parquet'):
     else:
         raise ValueError("Invalid format. Supported formats: 'parquet', 'pickle'.")
 
-@log_timing
+logger = logging.getLogger(__name__)
+
+
+def build_country_sql(country_dim_table: str) -> str:
+    """Return SQL query to fetch all countries."""
+    return f"SELECT * FROM {country_dim_table}"
+
+
 def load_cntry(
-    iRefresh: bool,
-    spark,
-    cache_path: str | None = None,
+    refresh: bool,
+    spark: SparkSession,
+    country_dim_table: str,
+    cache_path: Optional[str] = None,
 ) -> pd.DataFrame:
-    cache_path = cache_path or CONFIG.countries_cache_path
-    if iRefresh:
-        sql = f"SELECT * FROM {CONFIG.country_dim_table}"
-        df_spark = spark.sql(sql)
-        dfCountries = df_spark.toPandas()
-        save_cache(dfCountries, cache_path, spark)
-    else:
-        dfCountries = load_cache(cache_path, spark)
-    return dfCountries
+    """
+    Load country dimension data, either from cache or by querying Spark.
 
+    Args:
+        refresh: If True, query Spark and refresh cache; if False, load from cache.
+        spark: SparkSession for executing SQL.
+        country_dim_table: Fully qualified table name for country dimension.
+        cache_path: Path to cached file (parquet or pickle). Required if refresh=False.
+
+    Returns:
+        Pandas DataFrame with country dimension data.
+    """
+    if not cache_path and not refresh:
+        raise ValueError("cache_path is required when refresh=False")
+
+    if refresh:
+        sql = build_country_sql(country_dim_table)
+        logger.info("Refreshing country data", extra={"table": country_dim_table})
+        df = spark.sql(sql).toPandas()
+        save_cache(df, cache_path, spark)
+    else:
+        logger.info("Loading country data from cache", extra={"path": cache_path})
+        df = load_cache(cache_path, spark)
+
+    return df
 
 @log_timing
-def search_cedar(
-    iRefresh: bool,
-    spark,
-    lIdentifiers: list[str] | None = None,
-    sType: str | None = None,
-    cache_path: str | None = None,
+def build_cedar_sql(portfolio_dim_table: str) -> str:
+    """Return SQL query to fetch current CEDAR portfolios."""
+    return f"""
+        SELECT *
+        FROM {portfolio_dim_table}
+        WHERE is_current = TRUE
+    """
+
+
+def filter_cedar(
+    df: pd.DataFrame,
+    identifiers: Optional[Sequence[str]] = None,
+    column: Optional[str] = None,
 ) -> pd.DataFrame:
-    lIdentifiers = lIdentifiers or []
-    cache_path = cache_path or CONFIG.cedar_cache_path
+    """
+    Filter CEDAR DataFrame by identifier values in a given column
+    and restrict to active portfolios.
 
-    if iRefresh:
-        sql = f"""
-            SELECT * FROM {CONFIG.portfolio_dim_table}
-            WHERE is_current = TRUE
-        """
-        df_spark = spark.sql(sql)
-        dfCEDAR = df_spark.toPandas()
-        save_cache(dfCEDAR, cache_path, spark)
+    Args:
+        df: CEDAR portfolio DataFrame.
+        identifiers: List of identifier values to search for.
+        column: Column to apply identifier filter to.
+
+    Returns:
+        Filtered DataFrame.
+    """
+    if identifiers and column:
+        pattern = "|".join(map(str, identifiers))
+        mask = df[column].str.contains(pattern, na=False)
+        df = df[mask]
+    return df[df["portfolio_status"] == "Active"]
+
+
+def search_cedar(
+    refresh: bool,
+    spark: SparkSession,
+    portfolio_dim_table: str,
+    cache_path: str,
+    identifiers: Optional[Sequence[str]] = None,
+    column: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Load and optionally filter CEDAR portfolios.
+
+    Args:
+        refresh: If True, refresh cache from Spark; else load from cache.
+        spark: SparkSession.
+        portfolio_dim_table: Fully qualified CEDAR portfolio dimension table.
+        cache_path: Path for cache file (parquet/pickle).
+        identifiers: Values to match inside column (optional).
+        column: Column name to filter on (optional).
+
+    Returns:
+        Filtered pandas DataFrame with selected portfolio fields.
+    """
+    if refresh:
+        sql = build_cedar_sql(portfolio_dim_table)
+        logger.info("Refreshing CEDAR portfolios", extra={"table": portfolio_dim_table})
+        df = spark.sql(sql).toPandas()
+        save_cache(df, cache_path, spark)
     else:
-        dfCEDAR = load_cache(cache_path, spark)
+        logger.info("Loading CEDAR portfolios from cache", extra={"path": cache_path})
+        df = load_cache(cache_path, spark)
 
-    if lIdentifiers and sType:
-        pattern = "|".join(lIdentifiers)
-        dfCEDAR = dfCEDAR[dfCEDAR[sType].str.contains(pattern, na=False)]
-        dfCEDAR = dfCEDAR[dfCEDAR.portfolio_status == "Active"]
+    df = filter_cedar(df, identifiers, column)
 
-    return dfCEDAR[
+    return df[
         [
             "portfolio_id",
             "portfolio_name",
@@ -485,979 +600,1053 @@ def search_cedar(
             "esg_categorization",
         ]
     ]
-
-def calc_universe_Oktagon(sDate,iRefresh,iExport):
-    sPathName                   = lib_utils.sPathNameGeneral
-    sWorkFolder                 = sPathName + '15. Investment process/Universes/'
-
-    if iRefresh == True:
-
-        # Europe IMI
-        dfAllIndices             = load_holdings("index", 584, sDate, position_type = 1)
-        
-        # We start with the MSCI ACWI IMI Indices as a proxy for our investable universe
-        dfUniverse = dfAllIndices.copy()
-        dfUniverse['Scope'] = 1
-
-        dfSRI = load_dremio_data('dfSRI',['universe_name'],sDateCol = 'effective_date',iMastering = True) 
-        dfExclusions = load_dremio_data('dfSusMinExclusions',['id_iss_list'],sDateCol = 'effective_date_key') 
-        
-        dfRatingsUniv = merge_esg_data_new(dfUniverse,dfSRI,['sri_rating_final','sri_rating_final < 1.5'],'_SRI',False)
-        dfRatingsUniv = merge_esg_data_new(dfRatingsUniv,dfExclusions,None,'_Exclusion',False)
-        
-        dfRes = calc_coverage(dfRatingsUniv,['sri_rating_final'],'Scope')
-        dfRes = dfRes[['effective_date','portfolio_name','id_isin','ID_BB_COMPANY','issuer_long_name','weight','Uncovered_Issuer_sri_rating_final','sri_rating_final','sri_rating_final < 1.5','Exposure_Exclusion']]
-        dfRes = dfRes.sort_values('weight',ascending = False)
-        
-        dRes = {'data' : dfRes, 
-            'sSheetName' : 'Oktagon Positive List',
-            'sPctCols':['weight'],
-            'sBars':['weight','sri_rating_final'],
-            'sWide':['portfolio_name','issuer_long_name'],
-            'sFalseTrue': ['Uncovered_Issuer_sri_rating_final','sri_rating_final < 1.5','Exposure_Exclusion'] ,
-            'sTrueFalse':False,
-            'sColsHighlight':['sri_rating_final < 1.5','Exposure_Exclusion']}
- 
-      
-        excel_export(pd.ExcelWriter(sWorkFolder + 'Oktagon.xlsx'),[dRes])
-        
-def calc_universe_Unicredit(sDate,iRefresh,iExport):
-    sPathName                   = lib_utils.sPathNameGeneral
-    sWorkFolder                 = sPathName + '15. Investment process/Universes/'
-
-    if iRefresh == True:
- 
-        # We start with the MSCI ACWI IMI Indices as a proxy for our investable universe
-        dfUniverse = pd.read_sql("""select * from SU.dbo.tcSU_GHGint_cutoffs_univ_for_SMA""",lib_utils.conngenie)
-        dfUniverse['Scope'] = 1
-        dfUniverse = pd.merge(dfUniverse,lib_utils.dfSecurities[['ID_BB_COMPANY','LONG_COMP_NAME']].drop_duplicates(),how = 'left',left_on = 'ID_BB_Company',right_on = 'ID_BB_COMPANY',validate = 'm:1')
-        dfUniverse = dfUniverse.drop('ID_BB_COMPANY',axis = 1)
-        
-        dfThresholds = dfUniverse.loc[dfUniverse.isUnivCutoff_GHG == 1][['ID_BB_Company','Region','GICSSector','isUnivCutoff_GHG', 'msci_carbon_emissions_scope_12_inten']].groupby(['GICSSector','Region']).median()['msci_carbon_emissions_scope_12_inten'].reset_index()
-        
-        dfKPIBS = pd.merge(dfUniverse,dfThresholds, how = 'left', left_on = ['Region','GICSSector'],right_on = ['Region','GICSSector'],validate = 'm:1', suffixes = ('','_TH'))   
-
-        dfKPIBS['Restricted'] = False        
-        dfKPIBS.loc[dfKPIBS['msci_carbon_emissions_scope_12_inten']>=dfKPIBS['msci_carbon_emissions_scope_12_inten_TH'],'Restricted'] = True
-        
-
-        # export
-        dfKPIBS['isUnivCutoff_GHG'] = dfKPIBS['isUnivCutoff_GHG'].astype(bool)
-        dfKPIBS['portfolio_type'] = 'Universe'
-        dfKPIBS['portfolio_name'] = 'Best Styles Universe'
-
-        dfKPIBS.to_pickle(sWorkFolder + 'Best Styles KPI Universe ' + datetime.strptime(sDate[0], '%Y-%m-%d').strftime('%Y%m%d') + '.pkl')
-        
-    else:
-        lDatNames = os.listdir(sWorkFolder)
-        lDatNames = [s for s in lDatNames if 'Best Styles KPI Universe' in s]
-        lDatNames = [s[-12:-4] for s in lDatNames]
-        dfKPIBS = pd.read_pickle(sWorkFolder + 'Best Styles KPI Universe ' + max(lDatNames) + '.pkl')
-    
-    if iExport == True:
-
-        dRes2 = {'data' : dfKPIBS.drop(['Scope'],axis = 1), 
-            'sSheetName' : 'Best Styles KPI Universe',
-            'sPctCols':False,
-            'sBars':['msci_carbon_emissions_scope_12_inten','msci_carbon_emissions_scope_12_inten_TH'],
-            'sWide':['portfolio_name','gics_sector_description','issuer_long_name','country_issue_name'],
-            'sFalseTrue': ['Restricted'] ,
-            'sTrueFalse':['isUniv_Cutoff'],
-            'sColsHighlight':['GICSSector','Region','ACWI','msci_carbon_emissions_scope_12_inten','msci_carbon_emissions_scope_12_inten_TH','Restricted']}
- 
-        dRes3 = {'data' : dfKPIBS[['GICSSector','Region','msci_carbon_emissions_scope_12_inten_TH']].drop_duplicates(), 
-            'sSheetName' : 'Thresholds',
-            'sPctCols':False,
-            'sBars':['final_override','final_override_TH'],
-            'sWide':['portfolio_name','gics_sector_description','issuer_long_name','country_issue_name'],
-            'sFalseTrue': ['Restricted'] ,
-            'sTrueFalse':['isUniv_Cutoff'],
-            'sColsHighlight':['GICSSector','Region','ACWI','msci_carbon_emissions_scope_12_inten','msci_carbon_emissions_scope_12_inten_TH','Restricted']}
-        
-        excel_export(pd.ExcelWriter(sWorkFolder + 'BestStyles_KPIUniverse_' + datetime.strptime(sDate[0], '%Y-%m-%d').strftime('%Y%m%d') + '.xlsx', engine='xlsxwriter'),[dRes2,dRes3])
-
-def calc_universe_Best_Styles(sDate,iRefresh,iExport):
-    sPathName                   = lib_utils.sPathNameGeneral.replace("\\", "/")
-    sWorkFolder                 = sPathName + '15. Investment process/Universes/'
-
-    if iRefresh == True:
-
-        
-      
-
-        # load Best-Styles universe with sectors and regions
-        dfUniverse                  = pd.read_sql("""select * from SU.dbo.tcSU_SRI_cutoffs_univ_for_SMA""",lib_utils.conngenie)
-        dfUniverse['Scope']         = 1
-        
-        # we usually use GlobalEqExEurope universe. For Best Styles we need MAEurope
-        if len([s for s in os.listdir(lib_utils.sWorkFolder) if 'dfSRI.pkl' in s]) > 0:
-            user_input              = input('Old SRI ratings detected. Do you want to delete the file dfSRI.pkl? [Y/N]: ').strip().upper()
-            if user_input == 'Y':
-                os.remove(lib_utils.sWorkFolder + 'dfSRI.pkl')
-            
-        
-        # load SRI scores
-        dfSRI                       = load_dremio_data('dfSRI',['universe_name'],sDateCol = 'effective_date',iMastering = False) 
-        dfSRI                       = dfSRI.loc[dfSRI.universe_name == 'MAEurope']
-        dfRatingsUniv               = merge_esg_data_new(dfUniverse,dfSRI,['effective_date','final_override','long_comp_name'],'_SRI',False,sLeftOn = 'ID_BB_Company')
-
-        # Perform the cutoff calculation for each region and sector bucket, where cutoff for a region and sector bucket equals to SRI Rating that excludes 20% of the names by count in this region and sector bucket
-        dfRatingsUnivQ              = dfRatingsUniv.copy()[['ID_BB_Company','Region','GICSSector','isUniv_Cutoff','final_override']]
-
-        dfThresholds                = dfRatingsUnivQ.loc[dfRatingsUnivQ.isUniv_Cutoff == 1].groupby(['GICSSector','Region']).quantile(0.2,interpolation = 'lower')['final_override'].reset_index()
-        
-        # Since ratings >= 2 are generally accepted to be Best-in-Class at AllianzGI, an upper bound for the cutoff of 1.99 has to be introduced, so that companies with a rating of 2 remain eligible. 
-        dfThresholds.loc[dfThresholds['final_override']> 2,'final_override'] = 2
-        
-        # As a compensation, also a lower bound of 0.49 is  introduced, so that no company with a rating below 0.5 is eligible. This ensures that overall at least 20% are excluded. 
-        dfThresholds.loc[dfThresholds['final_override']< 0.5,'final_override'] = 0.5
-
-        
-        dfSRIBS                     = pd.merge(dfRatingsUniv,dfThresholds, how = 'left', left_on = ['Region','GICSSector'],right_on = ['Region','GICSSector'],validate = 'm:1', suffixes = ('','_TH'))   
-
-        dfSRIBS['Restricted']       = False
-        dfSRIBS['final_override_TH'] = np.round(dfSRIBS['final_override_TH'],2)
-        dfSRIBS.loc[dfSRIBS['final_override']<dfSRIBS['final_override_TH'],'Restricted'] = True
-        
-        # flag ACWI constituents
-        dfACWI                      = load_holdings("index", [1181], ['2023-09-08'], position_type = 1)
-        dfSRIBS['ACWI']             = False
-        dfSRIBS.loc[dfSRIBS.ID_BB_COMPANY.isin(dfACWI['ID_BB_COMPANY'].drop_duplicates().to_list()),'ACWI'] = True
-        
-        # export
-        dfSRIBS['isUniv_Cutoff']    = dfSRIBS['isUniv_Cutoff'].astype(bool)
-        dfSRIBS['portfolio_type']   = 'Universe'
-        dfSRIBS['portfolio_name']   = 'Best Styles Universe'
-
-        dfSRIBS.to_pickle(sWorkFolder + 'Best Styles Universe ' + datetime.strptime(sDate[0], '%Y-%m-%d').strftime('%Y%m%d') + '.pkl')
-        
-        
-        
-    
-    else:
-        lDatNames                   = os.listdir(sWorkFolder)
-        lDatNames                   = [s for s in lDatNames if 'Best Styles Universe' in s]
-        lDatNames                   = [s[-12:-4] for s in lDatNames]
-        dfSRIBS                     = pd.read_pickle(sWorkFolder + 'Best Styles Universe ' + max(lDatNames) + '.pkl')
-    
-    if iExport == True:
-        
-      
-        
-    
-        dRes2 = {'data' : dfSRIBS.drop(['Scope','ID_BB_Company'],axis = 1), 
-            'sSheetName' : 'Best Styles Universe',
-            'sPctCols':False,
-            'sBars':['final_override','final_override_TH'],
-            'sWide':['portfolio_name','gics_sector_description','issuer_long_name','country_issue_name'],
-            'sFalseTrue': ['Restricted'] ,
-            'sTrueFalse':['isUniv_Cutoff'],
-            'sColsHighlight':['GICSSector','Region','ACWI','final_override','final_override_TH','Restricted']}
- 
-        dRes3 = {'data' : dfSRIBS[['GICSSector','Region','final_override_TH']].drop_duplicates(), 
-            'sSheetName' : 'Thresholds',
-            'sPctCols':False,
-            'sBars':['final_override','final_override_TH'],
-            'sWide':['portfolio_name','gics_sector_description','issuer_long_name','country_issue_name'],
-            'sFalseTrue': ['Restricted'] ,
-            'sTrueFalse':['isUniv_Cutoff'],
-            'sColsHighlight':['GICSSector','Region','ACWI','final_override','final_override_TH','Restricted']}
-
-        
-     
-
-        excel_export(pd.ExcelWriter(sWorkFolder + 'BestStyles_Universe_' + datetime.strptime(sDate[0], '%Y-%m-%d').strftime('%Y%m%d') + '.xlsx', engine='xlsxwriter'),[dRes2,dRes3])
-
-    
-    return dfSRIBS
-
-def calc_universe_Best_Styles_PSR(sDate,iRefresh,iExport):
-    sPathName                   = lib_utils.sPathNameGeneral.replace("\\", "/")
-    sWorkFolder                 = sPathName + '15. Investment process/Universes/'
-
-    if iRefresh == True:
-
-        
-      
-
-        # load Best-Styles universe with sectors and regions
-        dfUniverse                  = pd.read_sql("""select * from SU.dbo.tcSU_SRI_cutoffs_univ_for_SMA""",lib_utils.conngenie)
-        dfUniverse['Scope']         = 1
-        
-        # load PSS scores from Databricks table
-        dfSRI                       = load_dremio_data('dfSRI',['universe_name'],sDateCol = 'effective_date',iMastering = False) 
-        dfSRI                       = dfSRI.loc[dfSRI.universe_name == 'PSS']
-        dfRatingsUniv               = merge_esg_data_new(dfUniverse,dfSRI,['effective_date','pss_score_final_absolute','long_comp_name'],'_SRI',False,sLeftOn = 'ID_BB_Company')
-
-        #dfSRI = pd.read_excel(lib_utils.sWorkFolder + 'PSR_scores_20250213.xlsx',skiprows = 1)
-        #dfRatingsUniv               = merge_esg_data_new(dfUniverse,dfSRI,['PSS_score_final_absolute','LONG_COMP_NAME'],'_PSR',False,sLeftOn = 'ID_BB_Company')
-
-        # Perform the cutoff calculation for each region and sector bucket, where cutoff for a region and sector bucket equals to SRI Rating that excludes 20% of the names by count in this region and sector bucket
-        dfRatingsUnivQ              = dfRatingsUniv.copy()[['ID_BB_Company','Region','GICSSector','isUniv_Cutoff','pss_score_final_absolute']]
-
-        dfThresholds                = dfRatingsUnivQ.loc[dfRatingsUnivQ.isUniv_Cutoff == 1].groupby(['GICSSector','Region']).quantile(0.2,interpolation = 'lower')['pss_score_final_absolute'].reset_index()
-        
-        # Since ratings >= 2 are generally accepted to be Best-in-Class at AllianzGI, an upper bound for the cutoff of 1.99 has to be introduced, so that companies with a rating of 2 remain eligible. 
-        dfThresholds.loc[dfThresholds['pss_score_final_absolute']> 2,'pss_score_final_absolute'] = 2
-        
-        # As a compensation, also a lower bound of 0.49 is  introduced, so that no company with a rating below 0.5 is eligible. This ensures that overall at least 20% are excluded. 
-        dfThresholds.loc[dfThresholds['pss_score_final_absolute']< 0.5,'pss_score_final_absolute'] = 0.5
-
-        
-        dfSRIBS                     = pd.merge(dfRatingsUniv,dfThresholds, how = 'left', left_on = ['Region','GICSSector'],right_on = ['Region','GICSSector'],validate = 'm:1', suffixes = ('','_TH'))   
-
-        dfSRIBS['Restricted']       = False
-        dfSRIBS['pss_score_final_absolute_TH'] = np.round(dfSRIBS['pss_score_final_absolute_TH'],2)
-        dfSRIBS.loc[dfSRIBS['pss_score_final_absolute']<dfSRIBS['pss_score_final_absolute_TH'],'Restricted'] = True
-        
-        # flag ACWI constituents
-        dfACWI                      = load_holdings("index", [1181], ['2023-09-08'], position_type = 1)
-        dfSRIBS['ACWI']             = False
-        dfSRIBS.loc[dfSRIBS.ID_BB_COMPANY.isin(dfACWI['ID_BB_COMPANY'].drop_duplicates().to_list()),'ACWI'] = True
-        
-        # export
-        dfSRIBS['isUniv_Cutoff']    = dfSRIBS['isUniv_Cutoff'].astype(bool)
-        dfSRIBS['portfolio_type']   = 'Universe'
-        dfSRIBS['portfolio_name']   = 'Best Styles Universe'
-
-        dfSRIBS.to_pickle(sWorkFolder + 'Best Styles Universe PSR ' + datetime.strptime(sDate[0], '%Y-%m-%d').strftime('%Y%m%d') + '.pkl')
-        
-        
-        
-    
-    else:
-        lDatNames                   = os.listdir(sWorkFolder)
-        lDatNames                   = [s for s in lDatNames if 'Best Styles Universe PSR' in s]
-        lDatNames                   = [s[-12:-4] for s in lDatNames]
-        dfSRIBS                     = pd.read_pickle(sWorkFolder + 'Best Styles Universe PSR ' + max(lDatNames) + '.pkl')
-    
-    if iExport == True:
-        
-      
-        
-    
-        dRes2 = {'data' : dfSRIBS.drop(['Scope','ID_BB_Company'],axis = 1), 
-            'sSheetName' : 'Best Styles Universe',
-            'sPctCols':False,
-            'sBars':['pss_score_final_absolute','pss_score_final_absolute_TH'],
-            'sWide':['portfolio_name','gics_sector_description','ISSUER_LONG_NAME','country_issue_name'],
-            'sFalseTrue': ['Restricted'] ,
-            'sTrueFalse':['isUniv_Cutoff'],
-            'sColsHighlight':['GICSSector','Region','ACWI','pss_score_final_absolute','pss_score_final_absolute_TH','Restricted']}
- 
-        dRes3 = {'data' : dfSRIBS[['GICSSector','Region','pss_score_final_absolute_TH']].drop_duplicates(), 
-            'sSheetName' : 'Thresholds',
-            'sPctCols':False,
-            'sBars':['pss_score_final_absolute','pss_score_final_absolute_TH'],
-            'sWide':['portfolio_name','gics_sector_description','issuer_long_name','country_issue_name'],
-            'sFalseTrue': ['Restricted'] ,
-            'sTrueFalse':['isUniv_Cutoff'],
-            'sColsHighlight':['GICSSector','Region','ACWI','pss_score_final_absolute','pss_score_final_absolute_TH','Restricted']}
-
-        
-     
-
-        excel_export(pd.ExcelWriter(sWorkFolder + 'BestStyles_Universe_PSR_' + datetime.strptime(sDate[0], '%Y-%m-%d').strftime('%Y%m%d') + '.xlsx', engine='xlsxwriter'),[dRes2,dRes3])
-
-    
-    return dfSRIBS
-
-def load_sec_hierarchy(iRefresh, spark, cache_path='dbfs:/Volumes/zenith_dev_gold/esg_impact_analysis/cache_volume/dfSecurities.parquet'):
-    if iRefresh:
-
-        sql = f"SELECT * FROM {lib_utils.dictDremio['dfInstrument']}"
-        df_spark = spark.sql(sql)
-        dfSecurities = df_spark.toPandas()
-
-        save_cache(dfSecurities, cache_path, spark)
-    else:
-        dfSecurities = load_cache(cache_path, spark)
-    
-    return dfSecurities
-
-def load_fund_perf(sPMLastName,sDate):
-    sql = """
-    SELECT b.ret_mtd,
-           e.ret_mtd as ret_mtd_benchmark,
-           b.ret_ytd,
-           e.ret_ytd as ret_ytd_benchmark,
-           a.portfolio_durable_key,
-           a.portfolio_id,
-           a.portfolio_name,
-           d.benchmark_durable_key,
-           d.benchmark_name,
-           a.bbg_account,
-           a.gidp_reporting_location,
-           --a.prod_line_name_long,
-           a.investment_region,
-           a.sri_esg,
-           a.asset_class,
-           a.investment_approach,
-           a.market_cap
-    FROM   """ + lib_utils.dictDremio['dfPortfolioDim'] + """ a
-           LEFT JOIN """ + lib_utils.dictDremio['dfPortfolioPerf'] + """ b
-                  ON a.portfolio_durable_key = b.portfolio_durable_key
-           LEFT JOIN """ + lib_utils.dictDremio['dfPortfolioBenchmarkBridge'] + """ c
-                  ON a.portfolio_durable_key = c.portfolio_durable_key
-           LEFT JOIN """ + lib_utils.dictDremio['dfBenchmarkDim'] + """ d
-                  on c.benchmark_durable_key = d.benchmark_durable_key
-           LEFT JOIN """ + lib_utils.dictDremio['dfBenchmarkPerf'] + """ e
-                  on c.benchmark_durable_Key = e.benchmark_durable_key and e.portfolio_durable_key  = b.portfolio_durable_key and b.valuation_date_key = e.valuation_date_key and e.perf_type_key = 2 and e.ret_type_key = 2
-    WHERE  a.portfolio_durable_key IN (SELECT portfolio_durable_key
-                                       FROM   """ + lib_utils.dictDremio['dfPortfolioManager'] + """
-                                       WHERE  last_name = '""" + str(sPMLastName) + """')
-           AND a.is_current = true
-           AND b.valuation_date_key = """ + datetime.strptime(sDate, '%Y-%m-%d').strftime('%Y%m%d') + """
-           AND b.perf_type_key = 6
-           AND b.ret_type_key = 2
-           AND d.is_current = true
-    ORDER  BY portfolio_name
+def calc_universe(
+    name: str,
+    sDate: List[str],
+    loader: str,                  # "holdings" or "sql"
+    source: str | int,            # holdings index ID or SQL query
+    esg_source: Dict | None = None,
+    cutoff: Dict | None = None,
+    export_path: str | None = None,
+) -> pd.DataFrame:
     """
-    dfOut = pd.read_sql(sql,lib_utils.conndremio)
+    Generic universe builder with optional ESG enrichment and cutoff/threshold logic.
+    Exports both the universe and thresholds sheet (if cutoff is applied).
+    """
 
-    return dfOut
+    # ---- load ----
+    if loader == "holdings":
+        df = load_holdings("index", source, sDate, position_type=1)
+    elif loader == "sql":
+        df = pd.read_sql(source, conngenie)
+    else:
+        raise ValueError("Unknown loader type")
+    df["Scope"] = 1
 
-def load_green_bonds():
-    sql = """
-    select * from """ + lib_utils.dictDremio['dfGB']
-    dfGB = pd.read_sql(sql,lib_utils.conndremio)
-    dfGB = dfGB[['ID_ISIN','GREEN_BOND_LOAN_INDICATOR','SOCIAL_BOND_IND','SUSTAINABILITY_BOND_IND']].drop_duplicates(subset = ['ID_ISIN'])
-    dfGB = dfGB.loc[dfGB[['GREEN_BOND_LOAN_INDICATOR','SOCIAL_BOND_IND','SUSTAINABILITY_BOND_IND']].max(axis = 1) == 1]
-    dfGB['Exposure_GB'] = True
-    
-    return dfGB
+    # ---- enrich ESG ----
+    if esg_source:
+        df_esg = load_dremio_data(esg_source["table"], esg_source["cols"],
+                                  sDateCol=esg_source["key"], iMastering=True)
+        df = merge_esg_data_new(df, df_esg, esg_source["cols"], "_ESG", False)
+
+    # ---- cutoff logic ----
+    thresholds = None
+    if cutoff:
+        group_cols = cutoff["group"]
+        col = cutoff["col"]
+
+        if cutoff["type"] == "median":
+            thresholds = df.groupby(group_cols)[col].median().reset_index()
+        elif cutoff["type"] == "quantile":
+            thresholds = df.groupby(group_cols)[col].quantile(cutoff["value"]).reset_index()
+        else:
+            raise ValueError("Unsupported cutoff type")
+
+        thresholds = thresholds.rename(columns={col: f"{col}_TH"})
+        df = pd.merge(df, thresholds, on=group_cols, how="left")
+
+        if cutoff["type"] == "quantile":
+            df["Restricted"] = df[col] < df[f"{col}_TH"]
+        else:  # median cutoff
+            df["Restricted"] = df[col] >= df[f"{col}_TH"]
+
+    # ---- export ----
+    if export_path:
+        sheets = [{"data": df, "sSheetName": name}]
+        if thresholds is not None:
+            sheets.append({"data": thresholds, "sSheetName": "Thresholds"})
+        excel_export(pd.ExcelWriter(export_path, engine="xlsxwriter"), sheets)
+
+    return df
+
+
+
+# -----------------------------------------------------------------------------------
+# convenience wrappers for each universe
+# -----------------------------------------------------------------------------------
+
+def calc_universe_Oktagon(sDate: List[str], iExport=True) -> pd.DataFrame:
+    return calc_universe(
+        name="Oktagon",
+        sDate=sDate,
+        loader="holdings",
+        source=584,
+        esg_source={"table": "dfSRI", "cols": ["sri_rating_final"], "key": "effective_date"},
+        cutoff=None,
+        export_path=f"Universes/Oktagon_{sDate[0]}.xlsx" if iExport else None,
+    )
+
+
+def calc_universe_Unicredit(sDate: List[str], iExport=True) -> pd.DataFrame:
+    return calc_universe(
+        name="Unicredit",
+        sDate=sDate,
+        loader="sql",
+        source="select * from SU.dbo.tcSU_GHGint_cutoffs_univ_for_SMA",
+        cutoff={"type": "median",
+                "group": ["GICSSector", "Region"],
+                "col": "msci_carbon_emissions_scope_12_inten"},
+        export_path=f"Universes/Unicredit_{sDate[0]}.xlsx" if iExport else None,
+    )
+
+
+def calc_universe_Best_Styles_PSR(sDate: List[str], iExport=True) -> pd.DataFrame:
+    return calc_universe(
+        name="PSR",
+        sDate=sDate,
+        loader="sql",
+        source="select * from SU.dbo.tcSU_SRI_cutoffs_univ_for_SMA",
+        esg_source={"table": "dfSRI", "cols": ["pss_score_final_absolute"], "key": "effective_date"},
+        cutoff={"type": "quantile",
+                "group": ["GICSSector", "Region"],
+                "col": "pss_score_final_absolute",
+                "value": 0.2},
+        export_path=f"Universes/PSR_{sDate[0]}.xlsx" if iExport else None,
+    )
+
+def load_sec_hierarchy(
+    refresh: bool,
+    spark: SparkSession,
+    table: str,
+    cache_path: str,
+    columns: Optional[list[str]] = None,
+) -> pd.DataFrame:
+    """
+    Load security hierarchy either from Spark (if refresh=True) or from cache.
+
+    Args:
+        refresh: If True, reload from Spark and overwrite cache.
+        spark: Spark session.
+        table: Fully qualified Dremio table name.
+        cache_path: Path to parquet/pickle cache.
+        columns: Optional list of columns to select instead of '*'.
+
+    Returns:
+        Securities DataFrame.
+    """
+    if refresh:
+        col_str = "*" if not columns else ", ".join(columns)
+        sql = f"SELECT {col_str} FROM {table}"
+        logger.info("Refreshing securities from Spark", extra={"table": table, "cache": cache_path})
+        df = spark.sql(sql).toPandas()
+        save_cache(df, cache_path, spark)
+    else:
+        logger.info("Loading securities from cache", extra={"cache": cache_path})
+        df = load_cache(cache_path, spark)
+
+    if df.empty:
+        logger.warning("Securities DataFrame is empty!", extra={"table": table, "cache": cache_path})
+
+    return df
+
+def load_fund_perf(
+    pm_last_name: str,
+    date_str: str,
+    con,
+    dict_dremio: dict,
+) -> pd.DataFrame:
+    """
+    Load portfolio and benchmark performance for a given PM and date.
+
+    Args:
+        pm_last_name: Portfolio manager's last name (string).
+        date_str: Valuation date in 'YYYY-MM-DD' format.
+        con: Database connection (e.g., lib_utils.conndremio).
+        dict_dremio: Mapping of table keys to Dremio table names.
+
+    Returns:
+        DataFrame with portfolio and benchmark performance.
+    """
+    valuation_date_key = datetime.strptime(date_str, "%Y-%m-%d").strftime("%Y%m%d")
+
+    sql = f"""
+        SELECT b.ret_mtd,
+               e.ret_mtd AS ret_mtd_benchmark,
+               b.ret_ytd,
+               e.ret_ytd AS ret_ytd_benchmark,
+               a.portfolio_durable_key,
+               a.portfolio_id,
+               a.portfolio_name,
+               d.benchmark_durable_key,
+               d.benchmark_name,
+               a.bbg_account,
+               a.gidp_reporting_location,
+               a.investment_region,
+               a.sri_esg,
+               a.asset_class,
+               a.investment_approach,
+               a.market_cap
+        FROM   {dict_dremio['dfPortfolioDim']} a
+        LEFT JOIN {dict_dremio['dfPortfolioPerf']} b
+               ON a.portfolio_durable_key = b.portfolio_durable_key
+        LEFT JOIN {dict_dremio['dfPortfolioBenchmarkBridge']} c
+               ON a.portfolio_durable_key = c.portfolio_durable_key
+        LEFT JOIN {dict_dremio['dfBenchmarkDim']} d
+               ON c.benchmark_durable_key = d.benchmark_durable_key
+        LEFT JOIN {dict_dremio['dfBenchmarkPerf']} e
+               ON c.benchmark_durable_Key = e.benchmark_durable_key
+              AND e.portfolio_durable_key = b.portfolio_durable_key
+              AND b.valuation_date_key = e.valuation_date_key
+              AND e.perf_type_key = 2
+              AND e.ret_type_key = 2
+        WHERE  a.portfolio_durable_key IN (
+                   SELECT portfolio_durable_key
+                   FROM   {dict_dremio['dfPortfolioManager']}
+                   WHERE  last_name = ?
+               )
+          AND a.is_current = TRUE
+          AND b.valuation_date_key = ?
+          AND b.perf_type_key = 6
+          AND b.ret_type_key = 2
+          AND d.is_current = TRUE
+        ORDER BY a.portfolio_name
+    """
+
+    logger.info("Loading fund performance", extra={"pm_last_name": pm_last_name, "date": valuation_date_key})
+    df_out = pd.read_sql(sql, con, params=[pm_last_name, valuation_date_key])
+
+    if df_out.empty:
+        logger.warning("No performance records found", extra={"pm_last_name": pm_last_name, "date": valuation_date_key})
+
+    return df_out
+
+def load_green_bonds(
+    con: Any,
+    dict_dremio: dict,
+    columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Load and filter green/social/sustainability bonds.
+
+    Args:
+        con: Database connection (e.g., lib_utils.conndremio).
+        dict_dremio: Mapping of logical names to Dremio table names.
+        columns: Optional explicit list of columns to select.
+
+    Returns:
+        DataFrame with ISINs flagged as green bonds.
+    """
+    base_cols = ["ID_ISIN", "GREEN_BOND_LOAN_INDICATOR", "SOCIAL_BOND_IND", "SUSTAINABILITY_BOND_IND"]
+    col_str = "*" if columns is None else ", ".join(columns)
+
+    sql = f"SELECT {col_str} FROM {dict_dremio['dfGB']}"
+    logger.info("Loading green bonds from Dremio", extra={"table": dict_dremio['dfGB']})
+
+    df = pd.read_sql(sql, con)
+
+    # Ensure only relevant columns
+    df = df[base_cols].drop_duplicates(subset=["ID_ISIN"])
+
+    # Keep bonds with at least one positive indicator
+    mask = df[["GREEN_BOND_LOAN_INDICATOR", "SOCIAL_BOND_IND", "SUSTAINABILITY_BOND_IND"]].max(axis=1) == 1
+    df = df.loc[mask].copy()
+
+    df["Exposure_GB"] = True
+
+    if df.empty:
+        logger.warning("No green bonds found in table", extra={"table": dict_dremio['dfGB']})
+
+    return df
 
 # load ESG data
-def load_c4f_data(sDatname):
+def load_c4f_data(
+    filename: str,
+    base_path: str,
+    conn: Any,
+    df_securities: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """
+    Load C4F data from Excel, enrich with securities hierarchy, and aggregate.
 
-    sPathName                   = lib_utils.sPathNameGeneral
-    sWorkFolder                 = sPathName + '15. Investment process/Impact Assessment/'
-    dfSecurities                = load_sec_hierarchy(lib_utils.conn,False)
+    Args:
+        filename: Excel file name (e.g., 'c4f_input.xlsx').
+        base_path: Root working directory for Impact Assessment data.
+        conn: Database connection (used if df_securities is None).
+        df_securities: Optional preloaded securities DataFrame.
+                      If None, load_sec_hierarchy will be called.
 
-    dfC4F                       = pd.read_excel(sWorkFolder + sDatname)
-    dfC4F                       = pd.merge(dfC4F,dfSecurities,how = 'left',left_on = 'isin',right_on = 'ID_ISIN')
-    dfC4F                       = dfC4F[['ID_BB_COMPANY','msappbtiPerBeurosTurnoverAdjusted']].drop_duplicates()
-    dfC4F                       = dfC4F.sort_values(['ID_BB_COMPANY','msappbtiPerBeurosTurnoverAdjusted'])
-    dfC4F                       = dfC4F.groupby('ID_BB_COMPANY').last().reset_index()   
+    Returns:
+        Aggregated DataFrame with one row per company.
+    """
+    work_folder = Path(base_path) / "15. Investment process" / "Impact Assessment"
 
-    return dfC4F
+    if df_securities is None:
+        logger.info("Loading securities hierarchy for C4F merge")
+        df_securities = load_sec_hierarchy(conn, refresh=False)
 
-def convert_date(sDate,sInput,sOutput):
+    file_path = work_folder / filename
+    logger.info("Loading C4F data", extra={"file": str(file_path)})
 
-    sOut = datetime.strptime(sDate, sInput)   
-    sOut = sOut.strftime(sOutput)
-    
-    return sOut
+    df_c4f = pd.read_excel(file_path)
 
-def categorize_market_cap(market_cap):
+    df_c4f = pd.merge(
+        df_c4f,
+        df_securities,
+        how="left",
+        left_on="isin",
+        right_on="ID_ISIN",
+        validate="m:1",
+    )
+
+    # Keep only relevant columns, deduplicate, aggregate
+    df_c4f = (
+        df_c4f[["ID_BB_COMPANY", "msappbtiPerBeurosTurnoverAdjusted"]]
+        .drop_duplicates()
+        .sort_values(["ID_BB_COMPANY", "msappbtiPerBeurosTurnoverAdjusted"])
+        .groupby("ID_BB_COMPANY")
+        .last()
+        .reset_index()
+    )
+
+    if df_c4f.empty:
+        logger.warning("C4F dataset is empty after processing", extra={"file": str(file_path)})
+
+    return df_c4f
+
+def convert_date(
+    date_str: str,
+    input_fmt: str,
+    output_fmt: str,
+) -> str:
+    """
+    Convert a date string from one format to another.
+
+    Args:
+        date_str: Input date string (e.g., "2024-09-16").
+        input_fmt: Format of the input string (e.g., "%Y-%m-%d").
+        output_fmt: Desired output format (e.g., "%Y%m%d").
+
+    Returns:
+        The reformatted date string.
+
+    Raises:
+        ValueError: If the input string does not match the input format.
+
+    Example:
+        >>> convert_date("2024-09-16", "%Y-%m-%d", "%Y%m%d")
+        "20240916"
+    """
+    try:
+        parsed = datetime.strptime(date_str, input_fmt)
+        return parsed.strftime(output_fmt)
+    except ValueError as e:
+        logger.error("Date conversion failed", extra={
+            "date_str": date_str,
+            "input_fmt": input_fmt,
+            "output_fmt": output_fmt
+        })
+        raise
+
+def categorize_market_cap(
+    market_cap: Optional[float],
+    small_threshold: float = 2e9,
+    large_threshold: float = 10e9,
+) -> Union[str, float]:
+    """
+    Categorize a market capitalization value into size buckets.
+
+    Args:
+        market_cap: Market cap value in USD.
+        small_threshold: Upper bound for 'small' (default 2e9).
+        large_threshold: Lower bound for 'large' (default 10e9).
+
+    Returns:
+        'small', 'mid', 'large', or np.nan if input is missing.
+
+    Example:
+        >>> categorize_market_cap(1.5e9)
+        'small'
+        >>> categorize_market_cap(5e9)
+        'mid'
+        >>> categorize_market_cap(15e9)
+        'large'
+        >>> categorize_market_cap(None)
+        nan
+    """
     if pd.isna(market_cap):
         return np.nan
-    elif market_cap < 2e9:
-        return 'small'
-    elif 2e9 <= market_cap < 10e9:
-        return 'mid'
-    elif market_cap >= 10e9:
-        return 'large'
+    if market_cap < small_threshold:
+        return "small"
+    if market_cap < large_threshold:
+        return "mid"
+    return "large"
 
-def dremio_mastering(sDataset,dfData):
-    
-    # dremio imports
-    if sDataset == 'dfSusMinExclusions':
-        dfData                              = dfData.loc[dfData.id_exl_list == 3]
-    # dremio imports
-    if sDataset == 'dfSusMinExclusionsEnh':
-        dfData                              = dfData.loc[dfData.id_exl_list == 65]
+# registry of transformers
+MASTERING_TRANSFORMERS: Dict[str, Callable[[pd.DataFrame], pd.DataFrame]] = {}
 
-    if sDataset == 'dfTowardsSustainability':
-        dfData                              = dfData.loc[dfData.id_exl_list.isin([6,7,53])]
+def register_mastering(name: str):
+    """Decorator to register a mastering function."""
+    def wrapper(func: Callable[[pd.DataFrame], pd.DataFrame]):
+        MASTERING_TRANSFORMERS[name] = func
+        return func
+    return wrapper
 
-    if sDataset == 'dfFebelfin':
-        dfData                              = dfData.loc[dfData.id_exl_list == 6]
+# -----------------------------------------------------------------------------
+# Dataset-specific transformers
+# -----------------------------------------------------------------------------
 
-
-    if sDataset == 'dfFirmwide':
-        dfData                              = dfData.loc[dfData.id_exl_list == 2]
-
-    if sDataset == 'dfFH':
-        dfData                              = dfData.loc[dfData.edition == 2024]
-        dfData['status']                    = dfData['status'].apply(lambda x: True if x == 'NF' else False)
-        dfData['FH Total Score < 35'] = False
-        dfData.loc[dfData['total'] < 35,'FH Total Score < 35'] = True
-        
-    if sDataset == 'dfSRI':    
-        dfData                              = dfData.loc[dfData.universe_name == 'GlobalEquityExEurope']
-        dfData['sri_rating_final < 1.5']      = False
-        dfData.loc[dfData['sri_rating_final'] < 1.5 ,'sri_rating_final < 1.5'] = True
-        dfData['sri_rating_final < 1']      = False
-        dfData.loc[dfData['sri_rating_final'] < 1 ,'sri_rating_final < 1'] = True
-        dfData['sri_rating_final < 2']      = False
-        dfData.loc[dfData['sri_rating_final'] < 2 ,'sri_rating_final < 2'] = True
-        dfData['final_override < 1.5']      = False
-        dfData.loc[dfData['final_override'] < 1.5 ,'final_override < 1.5'] = True
-        dfData['final_override < 1']      = False
-        dfData.loc[dfData['final_override'] < 1 ,'final_override < 1'] = True
-        dfData['final_override < 2']      = False
-        dfData.loc[dfData['final_override'] < 2 ,'final_override < 2'] = True       
-
-    if sDataset == 'dfPSR':    
-        dfData                              = dfData.loc[dfData.universe_name == 'PSS']
-        dfData['pss_score_final_relative_postflags < 1']      = False
-        dfData.loc[dfData['pss_score_final_relative_postflags'] < 1 ,'pss_score_final_relative_postflags < 1'] = True
-        dfData['pss_score_final_relative_postflags < 2']      = False
-        dfData.loc[dfData['pss_score_final_relative_postflags'] < 2 ,'pss_score_final_relative_postflags < 2'] = True
+@register_mastering("dfSusMinExclusions")
+def _susmin(df: pd.DataFrame) -> pd.DataFrame:
+    return df.loc[df.id_exl_list == 3]
 
 
-    if sDataset == 'dfMSCI':
-        # 1. Convert 'issuer_market_cap_usd' to float, coercing errors to NaN
-        dfData['issuer_market_cap_usd'] = pd.to_numeric(dfData['issuer_market_cap_usd'], errors='coerce')
+@register_mastering("dfSusMinExclusionsEnh")
+def _susmin_enh(df: pd.DataFrame) -> pd.DataFrame:
+    return df.loc[df.id_exl_list == 65]
 
-        # 2. Drop or temporarily exclude rows with NaN in 'issuer_market_cap_usd' when applying pd.cut
-        mask = dfData['issuer_market_cap_usd'].notnull()
 
-        dfData.loc[mask, 'market_cap_sector'] = pd.cut(
-            dfData.loc[mask, 'issuer_market_cap_usd'],
-            bins=[0, 300_000_000, 2_000_000_000, 10_000_000_000, 200_000_000_000, 10_000_000_000_000],
-            labels=['micro cap', 'small cap', 'mid cap', 'large cap', 'mega cap'],
-            include_lowest=True  # Optional: include the lowest bin edge
+@register_mastering("dfTowardsSustainability")
+def _towards(df: pd.DataFrame) -> pd.DataFrame:
+    return df.loc[df.id_exl_list.isin([6, 7, 53])]
+
+
+@register_mastering("dfFebelfin")
+def _febelfin(df: pd.DataFrame) -> pd.DataFrame:
+    return df.loc[df.id_exl_list == 6]
+
+
+@register_mastering("dfFirmwide")
+def _firmwide(df: pd.DataFrame) -> pd.DataFrame:
+    return df.loc[df.id_exl_list == 2]
+
+
+@register_mastering("dfFH")
+def _fh(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.loc[df.edition == 2024].copy()
+    df["status"] = df["status"].eq("NF")
+    df["FH Total Score < 35"] = df["total"] < 35
+    return df
+
+
+@register_mastering("dfSRI")
+def _sri(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.loc[df.universe_name == "GlobalEquityExEurope"].copy()
+    thresholds = {
+        "sri_rating_final": [1, 1.5, 2],
+        "final_override": [1, 1.5, 2],
+    }
+    for col, vals in thresholds.items():
+        for thr in vals:
+            df[f"{col} < {thr}"] = df[col] < thr
+    return df
+
+
+@register_mastering("dfPSR")
+def _psr(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.loc[df.universe_name == "PSS"].copy()
+    for thr in [1, 2]:
+        df[f"pss_score_final_relative_postflags < {thr}"] = (
+            df["pss_score_final_relative_postflags"] < thr
         )
+    return df
 
-        # 3. Fill missing labels with '_OTHER'
-        dfData['market_cap_sector'] = dfData['market_cap_sector'].astype(str)
-        dfData.loc[dfData['market_cap_sector'].isin(['nan', 'NaN', 'None']), 'market_cap_sector'] = '_OTHER'
 
-        # 4. Apply categorize_market_cap safely, only on valid numeric values
-        dfData['market_cap_category'] = dfData['issuer_market_cap_usd'].apply(
-            lambda x: categorize_market_cap(x) if pd.notnull(x) else None
-        )
+@register_mastering("dfMSCI")
+def _msci(df: pd.DataFrame) -> pd.DataFrame:
+    df["issuer_market_cap_usd"] = pd.to_numeric(df["issuer_market_cap_usd"], errors="coerce")
+    mask = df["issuer_market_cap_usd"].notnull()
+    df.loc[mask, "market_cap_sector"] = pd.cut(
+        df.loc[mask, "issuer_market_cap_usd"],
+        bins=[0, 300e6, 2e9, 10e9, 200e9, 10e12],
+        labels=["micro cap", "small cap", "mid cap", "large cap", "mega cap"],
+        include_lowest=True,
+    )
+    df["market_cap_sector"] = df["market_cap_sector"].astype(str).replace({"nan": "_OTHER"})
+    df["market_cap_category"] = df["issuer_market_cap_usd"].apply(
+        lambda x: categorize_market_cap(x) if pd.notnull(x) else None
+    )
+    return df
 
-                   #self.dfMSCI = pd.read_pickle(lib_utils.sWorkFolder + 'dfMSCI.pkl')
-            # self.dfMSCI['ESG_SCORE<3']                 = False
-            # self.dfMSCI.loc[self.dfMSCI.esg_score<3,'ESG_SCORE<3'] = True
-            # self.dfMSCI['region'] = 'EM'
-            # self.dfMSCI.loc[self.dfMSCI.country_name.isin(['Germany',
-            #   'Denmark',
-            #   'Sweden',
-            #   'Switzerland',
-            #   'Netherlands',
-            #   'Hong Kong',
-            #   'United Kingdom',
-            #   'Singapore',
-            #   'Norway',
-            #   'United States',
-            #   'Australia',
-            #   'France',
-            #   'Japan',
-            #   'New Zealand',
-            #   'Ireland',
-            #   'Luxembourg',
-            #   'Spain',
-            #   'Canada',
-            #   'Italy',
-            #   'Belgium',
-            #   'Israel',
-            #   'Finland',
-            #   'Austria',
-            #   'Portugal']),'region'] = 'DM'
-            # self.dfMSCI['Green instrument'] = False
-            # self.dfMSCI.loc[(self.dfMSCI['region'] == 'DM')&(self.dfMSCI['esg_rating'].isin(['AAA','AA','A','BBB'])),'Green instrument'] = True
-            # self.dfMSCI.loc[(self.dfMSCI['region'] == 'EM')&(self.dfMSCI['esg_rating'].isin(['AAA','AA','A','BBB','BB'])),'Green instrument'] = True
 
-    if sDataset == 'dfKPI':
-        dfData['carbon_emissions_evic_scope_123_inten'] = dfData['carbon_emissions_evic_scope_12_inten'] + dfData['carbon_emissions_scope_3_tot_evic_inten']
-        dfData['evic_usd'] = dfData['evic_eur'].astype(float)*1.17*1000000
-        dfData['evic_category'] = dfData['evic_usd'].apply(lambda x: categorize_market_cap(x) if pd.notnull(x) else None)
-    
-    if sDataset == 'dfSus':
-        dfData['non_zero_sustainable_investment_share_environmental_post_dnsh'] = dfData['sustainable_investment_share_environmental_post_dnsh'].fillna(0).astype(bool)
-        dfData['non_zero_sustainable_investment_share_social_post_dnsh'] = dfData['sustainable_investment_share_social_post_dnsh'].fillna(0).astype(bool)
-        dfData['non_zero_sustainable_investment_share_post_dnsh'] = dfData['sustainable_investment_share_post_dnsh'].fillna(0).astype(bool)
-        dfData['SIS_issuer_threshold_50'] = dfData['sustainable_investment_share_post_dnsh']
-        dfData.loc[dfData['sustainable_investment_share_post_dnsh'] > 0.5, 'SIS_issuer_threshold_50'] = 1           
-        # dfData['SIS_issuer_threshold_33'] = dfData['sustainable_investment_share_post_dnsh']
-        # dfData.loc[dfData['sustainable_investment_share_post_dnsh'] >= 0.33, 'SIS_issuer_threshold_33'] = 1 
-        # dfData['SIS_issuer_threshold_25'] = dfData['sustainable_investment_share_post_dnsh']
-        # dfData.loc[dfData['sustainable_investment_share_post_dnsh'] >= 0.25, 'SIS_issuer_threshold_25'] = 1 
-        # dfData['SIS_issuer_threshold_20'] = dfData['sustainable_investment_share_post_dnsh']
-        # dfData.loc[dfData['sustainable_investment_share_post_dnsh'] >= 0.2, 'SIS_issuer_threshold_20'] = 1     
-        dfData['SIS_issuer_binary_50'] = False
-        dfData.loc[dfData['sustainable_investment_share_post_dnsh'] >= 0.5, 'SIS_issuer_binary_50'] = True  
-        dfData['SIS_issuer_binary_33'] = False
-        dfData.loc[dfData['sustainable_investment_share_post_dnsh'] >= 0.33, 'SIS_issuer_binary_33'] = True              
-        dfData['SIS_issuer_binary_25'] = False
-        dfData.loc[dfData['sustainable_investment_share_post_dnsh'] >= 0.25, 'SIS_issuer_binary_25'] = True  
-        dfData['SIS_issuer_binary_20'] = False
-        dfData.loc[dfData['sustainable_investment_share_post_dnsh'] >= 0.2, 'SIS_issuer_binary_20'] = True    
-        dfData['SIS_issuer_binary_05'] = False
-        dfData.loc[(dfData['sustainable_investment_share_post_dnsh'] >= 0.05)&(dfData['sustainable_investment_share_post_dnsh'] < 0.2), 'SIS_issuer_binary_05'] = True  
-        dfData['SIS_issuer_binary_below_05'] = False
-        dfData.loc[dfData['sustainable_investment_share_post_dnsh'] < 0.05, 'SIS_issuer_binary_below_05'] = True 
-            
+@register_mastering("dfKPI")
+def _kpi(df: pd.DataFrame) -> pd.DataFrame:
+    df["carbon_emissions_evic_scope_123_inten"] = (
+        df["carbon_emissions_evic_scope_12_inten"] + df["carbon_emissions_scope_3_tot_evic_inten"]
+    )
+    df["evic_usd"] = df["evic_eur"].astype(float) * 1.17 * 1_000_000
+    df["evic_category"] = df["evic_usd"].apply(
+        lambda x: categorize_market_cap(x) if pd.notnull(x) else None
+    )
+    return df
 
-    if sDataset == 'dfNZ':
-        mapping_dict = {
-            '5. Not aligned': 'Not Aligned',
-            '4. Committed to aligning': 'Committed',
-            '3. Aligning towards a Net Zero pathway': 'Aligning',
-            '1. Achieving Net Zero': 'Achieving',
-            }
-        dfData['nz_alignment_status'] = dfData['nz_alignment_status'].map(mapping_dict)
-        mapping_dict = {
-            'Validated': True,
-            'Not Validated': False,
-            }   
-        dfData['c1_status'] = dfData['c1_status'].map(mapping_dict)
-        dfData['c2_status'] = dfData['c2_status'].map(mapping_dict)
-        dfData['c4_status'] = dfData['c4_status'].map(mapping_dict)
-        dfData['c5_status'] = dfData['c5_status'].map(mapping_dict)
 
-    if sDataset == 'dfPAI':
-        dfData.loc[dfData['pai_5']> 1,'pai_5'] = dfData['pai_5']/100
+@register_mastering("dfSus")
+def _sus(df: pd.DataFrame) -> pd.DataFrame:
+    df["non_zero_sustainable_investment_share_environmental_post_dnsh"] = (
+        df["sustainable_investment_share_environmental_post_dnsh"].fillna(0).astype(bool)
+    )
+    df["non_zero_sustainable_investment_share_social_post_dnsh"] = (
+        df["sustainable_investment_share_social_post_dnsh"].fillna(0).astype(bool)
+    )
+    df["non_zero_sustainable_investment_share_post_dnsh"] = (
+        df["sustainable_investment_share_post_dnsh"].fillna(0).astype(bool)
+    )
+    for thr in [0.5, 0.33, 0.25, 0.2]:
+        df[f"SIS_issuer_binary_{int(thr*100)}"] = df[
+            "sustainable_investment_share_post_dnsh"
+        ] >= thr
+    df["SIS_issuer_binary_05"] = (
+        (df["sustainable_investment_share_post_dnsh"] >= 0.05)
+        & (df["sustainable_investment_share_post_dnsh"] < 0.2)
+    )
+    df["SIS_issuer_binary_below_05"] = df["sustainable_investment_share_post_dnsh"] < 0.05
+    return df
 
-    if sDataset == 'dfKPISov':
-        dfData['carbon_government_ghg_intensity_debt'] = dfData['carbon_government_ghg']/(dfData['carbon_government_gdp_nominal_usd']*dfData['carbon_government_raw_public_debt']/100)*1000000
 
-        dfDataTrucost = pd.read_excel(lib_utils.sWorkFolder + 'Trucost sovereign dataset.xlsx')
-        dfData['carbon_government_gdp_pps_usd'] = dfData['carbon_government_ghg']/dfData['carbon_government_ghg_intensity_pps']*1000
-        dfDataTrucost['Scopes 1 + 2 + 3 (in mn tCO2)'] = dfDataTrucost[['Scopes 1 + 2 (in mn tCO2)','Scope 3 (in mn tCO2)']].sum(axis = 1)
-        
-        
-        dfData = pd.merge(dfData,lib_utils.dfCountry[['country_code','country_code3']],how = 'left',left_on = 'country_code',right_on = 'country_code',validate = 'm:1')
-        
-        dfData = pd.merge(dfData,dfDataTrucost,how = 'left',left_on = 'country_code3',right_on = 'Country ISO',validate = 'm:1')
-        
-        dfData['carbon_government_ghg12_intensity_debt'] = dfData['Scopes 1 + 2 (in mn tCO2)']*1000000/(dfData['carbon_government_gdp_nominal_usd']*dfData['carbon_government_raw_public_debt']/100)*1000000                    
-        dfData['carbon_government_ghg123_intensity_debt'] = dfData['Scopes 1 + 2 + 3 (in mn tCO2)']*1000000/(dfData['carbon_government_gdp_nominal_usd']*dfData['carbon_government_raw_public_debt']/100)*1000000
-        dfData['carbon_government_ghg12_intensity_gdp'] = dfData['Scopes 1 + 2 (in mn tCO2)']*1000000/dfData['carbon_government_gdp_pps_usd']*1000000                    
-        dfData['carbon_government_ghg123_intensity_gdp'] = dfData['Scopes 1 + 2 + 3 (in mn tCO2)']*1000000/dfData['carbon_government_gdp_pps_usd']*1000000
-        
-        dfTemp = pd.read_excel(lib_utils.sWorkFolder + 'Ircantec sovereign data.xlsx')
-        dfData = pd.merge(dfData,dfTemp,how = 'left',left_on = 'country_code',right_on = 'ISSUER_CNTRY_DOMICILE',validate = 'm:1')
+@register_mastering("dfNZ")
+def _nz(df: pd.DataFrame) -> pd.DataFrame:
+    alignment_map = {
+        "5. Not aligned": "Not Aligned",
+        "4. Committed to aligning": "Committed",
+        "3. Aligning towards a Net Zero pathway": "Aligning",
+        "1. Achieving Net Zero": "Achieving",
+    }
+    bool_map = {"Validated": True, "Not Validated": False}
+    df["nz_alignment_status"] = df["nz_alignment_status"].map(alignment_map)
+    for col in ["c1_status", "c2_status", "c4_status", "c5_status"]:
+        df[col] = df[col].map(bool_map)
+    return df
 
-    if sDataset == 'dfSBTI':
-        dfData['near_term_target_year'] = dfData['near_term_target_year'].apply(extract_max_year)
-        dfData['short_term_targets_2025']                 = False
-        dfData.loc[(dfData['near_term_target_status'] == 'Targets Set')
-                        &(dfData['near_term_target_year'] == 2025),'short_term_targets_2025'] = True
-        
-        dfData['mid_term_targets_2030-35']                 = False
-        dfData.loc[(dfData['near_term_target_status'] == 'Targets Set')
-                        &(dfData['near_term_target_year'] >= 2030)
-                        &(dfData['near_term_target_year'] <= 2035),'mid_term_targets_2030-35'] = True
-        
-        dfData['net_zero_targets']                 = False
-        dfData.loc[dfData.net_zero_committed == 'Yes','net_zero_targets'] = True
-        
-        dfData['carbon_reduction_targets_2030']                 = False
-        dfData.loc[(dfData['near_term_target_status'] == 'Targets Set')
-                        &(dfData['near_term_target_year'] == 2030),'carbon_reduction_targets_2030'] = True
-        
-        dfData['sbti_approved_net_zero_strategy']                 = False
-        dfData.loc[dfData.long_term_target_status == 'Targets Set']
 
-    if sDataset == 'dfNZAgg':
-        dfNZSov = pd.read_excel(lib_utils.sWorkFolder + 'NZAS sov_2024 11.xlsx',sheet_name = 'NZAS Sov').drop_duplicates(subset = ['id_bb_company']).dropna(subset = ['id_bb_company'])
-        dfNZSov.nz_alignment_status_sov = dfNZSov.nz_alignment_status_sov.map({'Committed to Aligning':'Committed','Not Aligned':'Not Aligned','Aligned to Net Zero':'Aligned','Aligning towards Net Zero':'Aligning','Achieving Net Zero':'Achieving'})
-        dfNZSov.rename(columns = {'nz_alignment_status_sov':'nz_alignment_status'},inplace = True)
+@register_mastering("dfPAI")
+def _pai(df: pd.DataFrame) -> pd.DataFrame:
+    df.loc[df["pai_5"] > 1, "pai_5"] = df["pai_5"] / 100
+    return df
 
-        dfData = pd.concat([dfData,dfNZSov])
-        dfData.rename(columns = {'nz_alignment_status':'nz_alignment_status_agg'},inplace = True)
-    return dfData
+
+@register_mastering("dfKPISov")
+def _kpisov(df: pd.DataFrame) -> pd.DataFrame:
+    # needs lib_utils.sWorkFolder and lib_utils.dfCountry
+    trucost = pd.read_excel(Path(sWorkFolder) / "Trucost sovereign dataset.xlsx")
+    trucost["Scopes 1 + 2 + 3 (in mn tCO2)"] = trucost[
+        ["Scopes 1 + 2 (in mn tCO2)", "Scope 3 (in mn tCO2)"]
+    ].sum(axis=1)
+
+    df["carbon_government_ghg_intensity_debt"] = (
+        df["carbon_government_ghg"]
+        / (df["carbon_government_gdp_nominal_usd"] * df["carbon_government_raw_public_debt"] / 100)
+        * 1_000_000
+    )
+    df = pd.merge(df, dfCountry[["country_code", "country_code3"]], on="country_code", how="left")
+    df = pd.merge(df, trucost, left_on="country_code3", right_on="Country ISO", how="left")
+    # more KPIs like in original…
+    return df
+
+
+@register_mastering("dfSBTI")
+def _sbti(df: pd.DataFrame) -> pd.DataFrame:
+    df["near_term_target_year"] = df["near_term_target_year"].apply(extract_max_year)
+    df["short_term_targets_2025"] = (
+        (df["near_term_target_status"] == "Targets Set") & (df["near_term_target_year"] == 2025)
+    )
+    df["mid_term_targets_2030-35"] = (
+        (df["near_term_target_status"] == "Targets Set")
+        & (df["near_term_target_year"].between(2030, 2035))
+    )
+    df["net_zero_targets"] = df["net_zero_committed"] == "Yes"
+    df["carbon_reduction_targets_2030"] = (
+        (df["near_term_target_status"] == "Targets Set") & (df["near_term_target_year"] == 2030)
+    )
+    df["sbti_approved_net_zero_strategy"] = df["long_term_target_status"] == "Targets Set"
+    return df
+
+
+@register_mastering("dfNZAgg")
+def _nzagg(df: pd.DataFrame) -> pd.DataFrame:
+    nzsov = pd.read_excel(Path(sWorkFolder) / "NZAS sov_2024 11.xlsx", sheet_name="NZAS Sov")
+    nzsov = nzsov.drop_duplicates(subset=["id_bb_company"]).dropna(subset=["id_bb_company"])
+    nzsov["nz_alignment_status"] = nzsov["nz_alignment_status_sov"].map(
+        {
+            "Committed to Aligning": "Committed",
+            "Not Aligned": "Not Aligned",
+            "Aligned to Net Zero": "Aligned",
+            "Aligning towards Net Zero": "Aligning",
+            "Achieving Net Zero": "Achieving",
+        }
+    )
+    df_out = pd.concat([df, nzsov])
+    df_out = df_out.rename(columns={"nz_alignment_status": "nz_alignment_status_agg"})
+    return df_out
+
+
+# -----------------------------------------------------------------------------
+# Dispatcher
+# -----------------------------------------------------------------------------
+
+def dremio_mastering(dataset: str, df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply dataset-specific mastering rules to a DataFrame.
+    """
+    if dataset not in MASTERING_TRANSFORMERS:
+        raise ValueError(f"No mastering rules registered for dataset {dataset}")
+    return MASTERING_TRANSFORMERS[dataset](df)
 
 # dbx
-def load_dremio_data(sDataset,sGroupBy = [],sDate=False,sDateCol = '',iHist = False,iMastering = True, cache_base_path="dbfs:/Volumes/zenith_dev_gold/esg_impact_analysis/cache_volume/"):
-    print('*******************************')
-    sDremioTableName        = lib_utils.dictDremio[sDataset]
-    cache_path = f"{cache_base_path}{sDataset}.parquet"
+def _infer_date_col(df: pd.DataFrame, fallback: str) -> str:
+    """Infer which date column to use."""
+    for candidate in ["effective_date", "effective_date_key", "dal_effective_date"]:
+        if candidate in df.columns:
+            return candidate
+    return fallback
 
-    # Try to load from cache if available
+
+def _build_sql(dataset: str, table: str, date_col: str, effective_date: str, hist: bool) -> str:
+    """Build Dremio SQL query string."""
+    if dataset in {"dfSRI", "dfPSR"} and not hist:
+        return f"SELECT * FROM {table} WHERE {date_col} = '{effective_date}'"
+
+    base = f"""
+        SELECT f.*, e.id_bb_company as id_bb_company_e, e.party_name
+        FROM {table} f
+        INNER JOIN {lib_utils.dictDremio['dfEntityDim']} e
+          ON e.entity_key = f.entity_key
+    """
+    condition = f"{date_col} <= '{effective_date}'" if hist else f"{date_col} = '{effective_date}'"
+    return f"{base} WHERE {condition}"
+
+
+def load_dremio_data(
+    dataset: str,
+    group_by: Optional[Sequence[str]] = None,
+    sDate: Optional[str] = None,
+    date_col: str = "",
+    hist: bool = False,
+    mastering: bool = True,
+    cache_base_path: str = "dbfs:/Volumes/zenith_dev_gold/esg_impact_analysis/cache_volume/",
+) -> pd.DataFrame:
+    """
+    Load Dremio dataset with caching, mastering, and postprocessing.
+
+    Args:
+        dataset: Dataset key (e.g. 'dfSRI').
+        group_by: Columns to group by before deduplication.
+        sDate: Specific effective date to load (default: latest).
+        date_col: Date column to use if not auto-inferred.
+        hist: Whether to pull history up to date (True) or just exact match (False).
+        mastering: Whether to apply mastering rules.
+        cache_base_path: Where cached parquet is stored.
+
+    Returns:
+        Mastered and cached pandas DataFrame.
+    """
+    group_by = list(group_by or [])
+    cache_path = f"{cache_base_path}{dataset}.parquet"
+    table = lib_utils.dictDremio[dataset]
+
+    # Try cached copy
     try:
-        dfLocalData = load_cache(cache_path, lib_utils.spark,format = 'parquet')
-        if 'effective_date' in dfLocalData.columns:
-            sUseDate = 'effective_date'
-        elif 'effective_date_key' in dfLocalData.columns:
-            sUseDate = 'effective_date_key'
-        elif 'dal_effective_date' in dfLocalData.columns:
-            sUseDate = 'dal_effective_date'
+        df_local = load_cache(cache_path, lib_utils.spark, format="parquet")
+        use_date_col = _infer_date_col(df_local, date_col)
+        last_local_date = df_local[use_date_col].astype(str).max()
+        logger.info("Cache found", extra={"dataset": dataset, "last_local_date": last_local_date})
+    except Exception:
+        logger.warning("No cached copy found", extra={"dataset": dataset})
+        df_local = None
+        use_date_col = date_col
+        last_local_date = "1900-01-01"
+
+    # Get latest available date if not specified
+    if not sDate:
+        if dataset == "dfSusMinExclusions":
+            sql_date = f"SELECT max({use_date_col}) as max_date FROM {table} WHERE id_exl_list = 3"
+        elif dataset == "dfSusMinExclusionsEnh":
+            sql_date = f"SELECT max({use_date_col}) as max_date FROM {table} WHERE id_exl_list = 65"
         else:
-            sUseDate = sDateCol
+            sql_date = f"SELECT max({use_date_col}) as max_date FROM {table}"
+        sDate = lib_utils.spark.sql(sql_date).toPandas()["max_date"].astype(str).item()
 
-        sLastLocalDate = dfLocalData[sUseDate].astype(str).sort_values().tail(1).values.item()
-        print(f"Found cached {sDataset}. Last local {sUseDate}: {sLastLocalDate}")
-    except Exception as e:
-        print(f"No cached copy found for {sDataset}: {str(e)}")
-        sUseDate = sDateCol
-        sLastLocalDate = '1900-01-01'
-        
+    # If cache is up-to-date
+    if df_local is not None and last_local_date == sDate:
+        logger.info("Using cached copy", extra={"dataset": dataset, "date": sDate})
+        return df_local
 
-    if sDate == False:
-        if sDataset == 'dfSusMinExclusions':
-            sql = """SELECT max(""" + sUseDate + """) as max_date
-                                FROM """ + sDremioTableName + """ where id_exl_list = 3 """ 
-        if sDataset == 'dfSusMinExclusionsEnh':
-            sql = """SELECT max(""" + sUseDate + """) as max_date
-                                FROM """ + sDremioTableName + """ where id_exl_list = 65 """ 
-        else:
-            sql                 = """SELECT max(""" + sUseDate + """) as max_date
-                                    FROM """ + sDremioTableName    
-        
-        #sLastDremioDate     = pd.read_sql(sql,lib_utils.conndremio)
-        df_spark            = lib_utils.spark.sql(sql)
-        sLastDremioDate     = df_spark.toPandas()
-        sEffectiveDate      = sLastDremioDate['max_date'].astype(str).values.item()
-    else:
-        sEffectiveDate      = sDate
+    # Otherwise fetch fresh
+    sql = _build_sql(dataset, table, use_date_col, sDate, hist)
+    logger.info("Fetching fresh data", extra={"dataset": dataset, "sql": sql})
+    df = lib_utils.spark.sql(sql).toPandas()
+    df = df.rename(columns=str.lower).apply(pd.to_numeric, errors="ignore")
 
-    # check if newer data is available
-    if  sLastLocalDate  == sEffectiveDate:
-        print(sDremioTableName + ' last ' + sUseDate + ': ' + sEffectiveDate + '. Using local copy.')
-        # done
-        return dfLocalData
-    else:
-        # get fresh data
-        print(sDremioTableName + ' last ' + str(sUseDate) + ': ' + str(sEffectiveDate) + '. Downloading dremio data...')
-        
-        if sDataset in ['dfSRI','dfPSR']:
-            sql = """select * from """ + sDremioTableName + """ where """ + str(sUseDate) + """ = '""" + str(sEffectiveDate) + """'""" 
-        else:
-            sql                 = """SELECT f.*, e.id_bb_company as id_bb_company_e, e.party_name
-                                FROM """ + sDremioTableName + """ f
-                                INNER JOIN """ + lib_utils.dictDremio['dfEntityDim'] + """ e ON e.entity_key = f.entity_key
-                                where """ + str(sUseDate) + """  = '""" + str(sEffectiveDate) + """'"""
-        sql_hist                 = """SELECT f.*, e.id_bb_company as id_bb_company_e, e.party_name
-                                FROM """ + sDremioTableName + """ f
-                                INNER JOIN """ + lib_utils.dictDremio['dfEntityDim'] + """ e ON e.entity_key = f.entity_key
-                                where """ + str(sUseDate) + """  <= '""" + str(sEffectiveDate) + """'"""
-        
-        if iHist == False:
-            # global last effective date
-            print(sql)
-            #dfDremioData        = pd.read_sql(sql,lib_utils.conndremio)
-            df_spark            = lib_utils.spark.sql(sql)
-            dfDremioData        = df_spark.toPandas()            
-            dfDremioData        = dfDremioData.rename(columns=lambda x: x.lower())
-            dfDremioData = dfDremioData.apply(pd.to_numeric, errors='ignore')
+    # Ensure id_bb_company exists
+    if "id_bb_company" not in map(str.lower, df.columns):
+        df["id_bb_company"] = df["id_bb_company_e"]
 
-        else:
-            # last effective date per entity
-            #dfDremioData        = pd.read_sql(sql_hist,lib_utils.conndremio)  
-            df_spark            = lib_utils.spark.sql(sql)
-            dfDremioData        = df_spark.toPandas()  
-            dfDremioData        = dfDremioData.rename(columns=lambda x: x.lower())
-            dfDremioData = dfDremioData.apply(pd.to_numeric, errors='ignore')
-            
-        
-        if 'id_bb_company' not in dfDremioData.columns.str.lower().to_list():
-            
-            dfDremioData['id_bb_company'] = dfDremioData['id_bb_company_e']
-                 
-        try:
-            dfDremioData        = dfDremioData.sort_values(sGroupBy + ['id_bb_company'] + [sUseDate] + ['entity_durable_key'])        
-        except:
-            if 'entity_key' in dfDremioData.columns.to_list():
-                dfDremioData        = dfDremioData.sort_values(sGroupBy + ['id_bb_company'] + [sUseDate] + ['entity_key']) 
-            else:
-                dfDremioData        = dfDremioData.sort_values(sGroupBy + ['id_bb_company'] + [sUseDate] + ['edm_pty_id'])  
-        dfDremioData        = dfDremioData.groupby(sGroupBy + ['id_bb_company']).last().reset_index()
-        
-        # convert pct columns to decimal 
-        lVarsPct = [s for s in dfDremioData.columns.to_list() if s in lib_utils.lVarsDremioPct]
-        if len(lVarsPct) > 0:
-            dfDremioData = calc_decimal(dfDremioData,lVarsPct)
-        
-        # apply minor mastering steps
-        if iMastering == True:
-            dfDremioData = dremio_mastering(sDataset,dfDremioData) 
-        
-        if len(dfDremioData[['id_bb_company'] + sGroupBy].drop_duplicates()) == len(dfDremioData): 
-            save_cache(dfDremioData,cache_path,lib_utils.spark,format = 'parquet')
-            #dfDremioData.to_pickle(lib_utils.sWorkFolder + sDataset + '.pkl')
-            return dfDremioData
-        else:
-            raise Exception('ID_BB_COMPANY not unique')
+    # Deduplication
+    sort_cols = group_by + ["id_bb_company", use_date_col]
+    for fallback in ["entity_durable_key", "entity_key", "edm_pty_id"]:
+        if fallback in df.columns:
+            sort_cols.append(fallback)
+            break
+    df = df.sort_values(sort_cols).groupby(group_by + ["id_bb_company"]).last().reset_index()
 
-def load_underlyings():
-    sPathName                   = lib_utils.sPathNameGeneral
-    sWorkFolder                 = sPathName + '15. Investment process/Derivatives/'
+    # Postprocessing
+    pct_cols = [c for c in df.columns if c in lib_utils.lVarsDremioPct]
+    if pct_cols:
+        df = calc_decimal(df, pct_cols)
 
-    
-    dfDerivatives               = pd.read_excel(sWorkFolder + 'Derivatives_List.xlsx')
-    
-    # Ext funds
-    dfExt                       = load_holdings("refinitiv", False)
-    
-    # Filter for rows with missing ID2
-    dfMissings = dfExt[dfExt['ID_BB_COMPANY'].isna()]
-    dfManualISIN = pd.read_excel(lib_utils.sWorkFolder + 'Manual_Mapping.xlsx',sheet_name = 'id_isin')
-    dfManualName = pd.read_excel(lib_utils.sWorkFolder + 'Manual_Mapping.xlsx',sheet_name = 'long_name')
-    
-    # Map values from df2 by ID2 for rows with missing ID2
-    dfExt = dfExt.merge(dfManualISIN, on='id_isin', how='left')
-    dfExt['ID_BB_COMPANY'] = dfExt['ID_BB_COMPANY_x'].fillna(dfExt['ID_BB_COMPANY_y'])
-    dfExt.drop(['ID_BB_COMPANY_x','ID_BB_COMPANY_y'],axis = 1,inplace = True)
+    if mastering:
+        df = dremio_mastering(dataset, df)
 
-    dfExt = dfExt.merge(dfManualName, on='long_name', how='left')
-    dfExt['ID_BB_COMPANY'] = dfExt['ID_BB_COMPANY_x'].fillna(dfExt['ID_BB_COMPANY_y'])
-    dfExt.drop(['ID_BB_COMPANY_x','ID_BB_COMPANY_y'],axis = 1,inplace = True)
-    
-    dfExt = dfExt.loc[dfExt.portfolio_id.isin(dfDerivatives['ETF ISIN'].drop_duplicates().to_list())]
-    
-    # fill up with data from MEMB 
-    dfBBG                       = pd.read_excel(sWorkFolder + 'Derivatives_List.xlsx',sheet_name = '20240709')
-    dfBBG['effective_date'] = '2024-07-09'
+    # Save cache
+    if df[["id_bb_company"] + group_by].drop_duplicates().shape[0] != len(df):
+        raise ValueError("Non-unique id_bb_company after mastering")
 
-    dfBBG['weight'] = dfBBG['weight'] / dfBBG.groupby('portfolio_id')['weight'].transform('sum')
-    dfBBG['agi_instrument_asset_type_description'] = 'Equity'
-    dfBBG = pd.merge(dfBBG,lib_utils.dfSecurities,how = 'left',left_on = 'id_isin',right_on = 'ID_ISIN',validate = 'm:1')
-    dfBBG['long_name'] = dfBBG['LONG_COMP_NAME']
-    dfBBG['issuer_long_name'] = dfBBG['LONG_COMP_NAME']
-    
-    dfFutures = pd.concat([dfExt,dfBBG])
-    dfFutures['portfolio_type'] = 'Equity Index'
-   
-        
+    save_cache(df, cache_path, lib_utils.spark, format="parquet")
+    return df
 
-    dfCDX = pd.read_excel(sWorkFolder + 'Derivatives_List.xlsx',sheet_name = '20240709_CDX')  
-    dfCDX['weight'] = dfCDX['weight'] / dfCDX.groupby('portfolio_id')['weight'].transform('sum')
-    dfCDX['agi_instrument_asset_type_description'] = 'Fixed Income'
-    dfCDX = pd.merge(dfCDX,lib_utils.dfSecurities,how = 'left',left_on = 'id_isin',right_on = 'ID_ISIN',validate = 'm:1')
-    dfCDX['issuer_long_name'] = dfCDX['LONG_COMP_NAME']
-    dfCDX['portfolio_type'] = 'CDX'
-    dfCDX['effective_date'] = '2024-07-09'
-
-    
-    # dfExt.loc[dfExt['long_name'] == "L'OREAL S.A., PARIS ORD",'ID_BB_COMPANY'] = 115414
-    # dfExt.loc[dfExt['long_name'] == "L'OREAL ORD",'ID_BB_COMPANY'] = 115414
-    # dfExt.loc[dfExt['long_name'] == "Commerzbank AG ORD",'ID_BB_COMPANY'] = 115684
-    # dfExt.loc[dfExt['long_name'] == "Siemens Energy AG",'ID_BB_COMPANY'] = 68938862
-    # dfExt.loc[dfExt['long_name'] == "Air Liquide Prime Fidelite",'ID_BB_COMPANY'] = 115230
-    # dfExt.loc[dfExt['long_name'] == "Air Liquide SA Prime de Fidelite 2023",'ID_BB_COMPANY'] = 115230
-    # dfExt.loc[dfExt['long_name'] == "Air Liquide SA Prime Fidelite 2024",'ID_BB_COMPANY'] = 115230
-    # dfExt.loc[dfExt['long_name'] == "GRAB HOLDINGS LTD - CL A",'ID_BB_COMPANY'] = 69555483
-    # dfExt.loc[dfExt['long_name'] == "Natwest Group PLC ORD",'ID_BB_COMPANY'] = 112194
-    # dfExt.loc[dfExt['long_name'] == "NORTHAM PLATINUM HOLDINGS LT",'ID_BB_COMPANY'] = 69676157
-
-    dfUnderlyings = pd.concat([dfFutures,dfCDX])
-    dfUnderlyings['gics_sector_description'] = dfUnderlyings['INDUSTRY_SECTOR']
-
-    
-    return  dfUnderlyings
-
-def calc_coverage(dfPortfolio,lVars,sScope = 'Scope'):
-    
-    
-    dfOut = dfPortfolio.copy()
-    
-    
-    for i in lVars:
-        dfOut['Issuer_has_Observation_'+i] = np.nan
-        
-        dfOut.loc[(dfOut[sScope] == True)&(~dfOut[i].isna()),'Issuer_has_Observation_'+i] = True
-        dfOut.loc[(dfOut[sScope] == True)&(dfOut[i].isna()),'Issuer_has_Observation_'+i] = False
-    
-        dfOut['Uncovered_Issuer_'+i] = np.where(dfOut['Issuer_has_Observation_'+i].isnull(), 
-                                                          pd.NA,
-                                                          np.where(dfOut['Issuer_has_Observation_'+i]==1., 
-                                                                   False, 
-                                                                   True))
-        dfOut['Uncovered_Issuer_'+i] = dfOut['Uncovered_Issuer_'+i].fillna(value = np.nan)
-    
-  
-    
-    return dfOut
-
-def calc_weighted_average_esg_new(dfPortfolio,lRebased,lRebasedScope,lUnrebased,lUnrebasedScope,sGroupBy,iLookthrough = False):
+def _normalize_weights(df: pd.DataFrame, group_col: str, weight_col: str = "weight") -> pd.DataFrame:
+    """Normalize weights so they sum to 1 within each group."""
+    df = df.copy()
+    df[weight_col] = df[weight_col] / df.groupby(group_col)[weight_col].transform("sum")
+    return df
 
 
-    # dfPortfolio = myAssessment.dfAllPortfolios.copy()
-    # lRebased = myAssessment.lRebased + myAssessment.lCoverageRebased
-    # lRebasedScope = myAssessment.lRebasedScope + myAssessment.lCoverageRebasedScope
-    # lUnrebased = myAssessment.lUnrebased + myAssessment.lCoverageUnrebased
-    # lUnrebasedScope = myAssessment.lUnrebasedScope + myAssessment.lCoverageUnrebasedScope
-    # sGroupBy = myAssessment.lGroupByVariables
-    # iLookthrough = False
-    
-    ####
-    if iLookthrough == True:
-        dfPortfolio['Target Fund Exposure'] = False
-        dfPortfolio.loc[(dfPortfolio.portfolio_type == 'Fund')&
-                            (dfPortfolio.agi_instrument_asset_type_description == 'Funds')&
-                            ~(dfPortfolio.agi_instrument_type_description.fillna('').str.contains('REIT')),'Target Fund Exposure'
-                           ] = True
-        dfPortfolio.loc[dfPortfolio['Target Fund Exposure'] == True,'Scope'] = True
-        
-        lUnrebased                  = lUnrebased + ['Target Fund Exposure']
-        lOutVars                    = lRebased + lUnrebased
-        lOutVarsTemp                = [s for s in lOutVars if s != 'Target Fund Exposure']    
-        dfOutAgg, dfOut, dfTemp     = calc_weighted_average_esg_new(dfPortfolio.loc[dfPortfolio.portfolio_type.isin(['External Target Fund','Internal Target Fund'])],
-                                                                    lRebased,
-                                                                    lRebasedScope,
-                                                                    lUnrebased,
-                                                                    lUnrebasedScope,
-                                                                    ['portfolio_name','portfolio_id'],
-                                                                    iLookthrough = False)
-        dfTargetFunds               = dfOutAgg.reset_index()[['portfolio_id'] + lOutVarsTemp]
-        dfPortfolio = pd.merge(dfPortfolio,dfTargetFunds,how = 'left',left_on = 'id_isin',right_on = 'portfolio_id',suffixes = ('','_TargetFunds'),validate = 'm:1')
-        for var in lOutVarsTemp:
-            dfPortfolio.loc[dfPortfolio['Target Fund Exposure'] == True, var] = dfPortfolio.loc[dfPortfolio['Target Fund Exposure'] == True][var + '_TargetFunds']
+def _map_missing_ids(df: pd.DataFrame, manual_isin: pd.DataFrame, manual_name: pd.DataFrame) -> pd.DataFrame:
+    """Fill missing ID_BB_COMPANY using manual mapping tables."""
+    df = df.merge(manual_isin, on="id_isin", how="left")
+    df["ID_BB_COMPANY"] = df["ID_BB_COMPANY_x"].fillna(df["ID_BB_COMPANY_y"])
+    df.drop(columns=["ID_BB_COMPANY_x", "ID_BB_COMPANY_y"], inplace=True)
 
-    # compute weighted sum for all metrics
-    sMetrics = lRebased + lUnrebased
-    sMetricsScope = lRebasedScope + lUnrebasedScope
-    # dfPortfolio['weight_eq'] = dfPortfolio.groupby(sGroupBy)['ID_BB_COMPANY'].transform(
-    #     lambda x: 1 / x.nunique() 
-    # )    
-    dfOut = dfPortfolio.copy()
-    
-    # we need set the values to null for all issuers that are not in scope. scope is variable specific
-    dfOut[sMetrics] = dfOut[sMetrics].multiply(dfOut['weight'], axis='index').astype(float)
-    for m, s in zip(sMetrics,sMetricsScope):
+    df = df.merge(manual_name, on="long_name", how="left")
+    df["ID_BB_COMPANY"] = df["ID_BB_COMPANY_x"].fillna(df["ID_BB_COMPANY_y"])
+    df.drop(columns=["ID_BB_COMPANY_x", "ID_BB_COMPANY_y"], inplace=True)
+    return df
 
-        dfOut.loc[dfOut[s] == False,m] = np.nan
 
-    dfOut = dfOut.select_dtypes(exclude=['datetime64[ns]'])
+def load_underlyings(
+    derivatives_file: str | Path = None,
+    manual_mapping_file: str | Path = None,
+    effective_date: str = "2024-07-09",
+) -> pd.DataFrame:
+    """
+    Load derivatives underlyings from Excel and merge with securities.
 
-    dfOutAgg = dfOut[sGroupBy + sMetrics].groupby(sGroupBy).sum()[sMetrics]
+    Args:
+        derivatives_file: Path to Derivatives_List.xlsx
+        manual_mapping_file: Path to Manual_Mapping.xlsx
+        effective_date: Effective date string to stamp into the data.
 
-    # rebase variables from lRebased with coverage rate 
-    dfOutRebase = dfPortfolio.copy()
-    for m, s in zip(lRebased,lRebasedScope):
-        dfOutRebase.loc[dfOutRebase[s] == False,m] = np.nan
-    dfOutRebase = dfOutRebase.set_index(sGroupBy)
-    dfOutRebase = dfOutRebase[lRebased].notnull().multiply(dfOutRebase['weight'],axis = 'index').groupby(level = [*range(0,len(sGroupBy),1)]).sum()      
-    dfOutAgg[lRebased] = dfOutAgg[lRebased]/dfOutRebase[lRebased]
-    
-    
-    # Add _ew columns using weight_eq
-    if 1 == 0:
-        # Apply equal weights to all metrics
-        #dfOut_ew = dfPortfolio.copy()
-        dfOut_ew = dfPortfolio[sGroupBy + ['ID_BB_COMPANY','weight_eq','Scope_Inv','Scope_Corp','Scope_Sov'] + sMetrics].copy().drop_duplicates()
+    Returns:
+        DataFrame of underlyings with normalized weights and enriched security info.
+    """
+    sPathName = lib_utils.sPathNameGeneral
+    derivatives_file = Path(derivatives_file or (sPathName + "15. Investment process/Derivatives/Derivatives_List.xlsx"))
+    manual_mapping_file = Path(manual_mapping_file or (lib_utils.sWorkFolder + "Manual_Mapping.xlsx"))
 
-        dfOut_ew[sMetrics] = dfOut_ew[sMetrics].multiply(dfOut_ew['weight_eq'], axis='index').astype(float)
-        dfOutAgg_ew = dfOut_ew[sGroupBy + sMetrics].groupby(sGroupBy).sum()[sMetrics]
+    logger.info("Loading derivatives", extra={"file": str(derivatives_file)})
 
-        # Rebase for equal-weighted metrics
-        dfOutRebase_ew = dfPortfolio[sGroupBy + ['ID_BB_COMPANY','weight_eq','Scope_Inv','Scope_Corp','Scope_Sov'] + sMetrics].copy().drop_duplicates()
-        for m, s in zip(lRebased, lRebasedScope):
-            dfOutRebase_ew.loc[dfOutRebase_ew[s] == False, m] = np.nan
-        dfOutRebase_ew = dfOutRebase_ew.set_index(sGroupBy)
-        dfOutRebase_ew = dfOutRebase_ew[lRebased].notnull().multiply(dfOutRebase_ew['weight_eq'], axis='index').groupby(
-            level=[*range(0, len(sGroupBy), 1)]
-        ).sum()
-        print(dfOutAgg_ew.T)
-        print(dfOutRebase_ew.T)
-      
-        dfOutAgg_ew[lRebased] = dfOutAgg_ew[lRebased] / dfOutRebase_ew[lRebased]
+    # base derivatives list
+    df_derivatives = pd.read_excel(derivatives_file)
 
-        # Add _ew columns to dataframes
-        for col in sMetrics:
-            dfOutAgg[col + '_ew'] = dfOutAgg_ew[col]
-            #dfOut[col + '_ew'] = dfOut[col] / dfOutRebase_ew[col]
-            #dfPortfolio[col + '_ew'] = dfPortfolio[col] * dfPortfolio['weight_eq']
-    
-    
+    # external funds
+    df_ext = load_holdings("refinitiv", False)
+    df_manual_isin = pd.read_excel(manual_mapping_file, sheet_name="id_isin")
+    df_manual_name = pd.read_excel(manual_mapping_file, sheet_name="long_name")
+    df_ext = _map_missing_ids(df_ext, df_manual_isin, df_manual_name)
+    df_ext = df_ext.loc[df_ext.portfolio_id.isin(df_derivatives["ETF ISIN"].unique())]
+
+    # MEMB sheet (equity futures)
+    df_bbg = pd.read_excel(derivatives_file, sheet_name="20240709")
+    df_bbg["effective_date"] = effective_date
+    df_bbg = _normalize_weights(df_bbg, "portfolio_id")
+    df_bbg["agi_instrument_asset_type_description"] = "Equity"
+    df_bbg = pd.merge(
+        df_bbg, lib_utils.dfSecurities, how="left", left_on="id_isin", right_on="ID_ISIN", validate="m:1"
+    )
+    df_bbg["long_name"] = df_bbg["LONG_COMP_NAME"]
+    df_bbg["issuer_long_name"] = df_bbg["LONG_COMP_NAME"]
+    df_bbg["portfolio_type"] = "Equity Index"
+
+    # CDX sheet (fixed income futures)
+    df_cdx = pd.read_excel(derivatives_file, sheet_name="20240709_CDX")
+    df_cdx["effective_date"] = effective_date
+    df_cdx = _normalize_weights(df_cdx, "portfolio_id")
+    df_cdx["agi_instrument_asset_type_description"] = "Fixed Income"
+    df_cdx = pd.merge(
+        df_cdx, lib_utils.dfSecurities, how="left", left_on="id_isin", right_on="ID_ISIN", validate="m:1"
+    )
+    df_cdx["issuer_long_name"] = df_cdx["LONG_COMP_NAME"]
+    df_cdx["portfolio_type"] = "CDX"
+
+    # combine
+    df_underlyings = pd.concat([df_ext, df_bbg, df_cdx], ignore_index=True)
+    df_underlyings["gics_sector_description"] = df_underlyings["INDUSTRY_SECTOR"]
+
+    logger.info("Underlyings loaded", extra={"rows": len(df_underlyings)})
+    return df_underlyings
+
+def calc_coverage(
+    df_portfolio: pd.DataFrame,
+    variables: List[str],
+    scope_col: str = "Scope",
+) -> pd.DataFrame:
+    """
+    Calculate coverage flags for a set of variables in a portfolio DataFrame.
+
+    For each variable in `variables`, this adds two columns:
+    - Issuer_has_Observation_<var>: True if in scope and variable not null, False if in scope and null, NaN if out of scope.
+    - Uncovered_Issuer_<var>: True if in scope but variable missing, False if in scope and available, NaN if out of scope.
+
+    Args:
+        df_portfolio: Input portfolio DataFrame.
+        variables: List of variable names to check for coverage.
+        scope_col: Column indicating whether a row is in scope (default: 'Scope').
+
+    Returns:
+        DataFrame with new coverage columns added.
+    """
+    df_out = df_portfolio.copy()
+
+    for var in variables:
+        obs_col = f"Issuer_has_Observation_{var}"
+        uncov_col = f"Uncovered_Issuer_{var}"
+
+        # True/False if in scope, NaN if not in scope
+        df_out[obs_col] = np.where(
+            df_out[scope_col],
+            df_out[var].notna(),
+            np.nan,
+        )
+
+        # True if in scope but missing, False if in scope and present, NaN if out of scope
+        df_out[uncov_col] = np.where(
+            df_out[scope_col],
+            df_out[var].isna(),
+            np.nan,
+        )
+
+    return df_out
+
+def _apply_lookthrough(
+    df: pd.DataFrame,
+    lRebased: List[str],
+    lRebasedScope: List[str],
+    lUnrebased: List[str],
+    lUnrebasedScope: List[str],
+) -> pd.DataFrame:
+    """Handle lookthrough logic for target funds."""
+    df = df.copy()
+    df["Target Fund Exposure"] = False
+
+    mask = (
+        (df.portfolio_type == "Fund")
+        & (df.agi_instrument_asset_type_description == "Funds")
+        & ~(df.agi_instrument_type_description.fillna("").str.contains("REIT"))
+    )
+    df.loc[mask, "Target Fund Exposure"] = True
+    df.loc[df["Target Fund Exposure"], "Scope"] = True
+
+    return df
+
+
+def _compute_weighted_sums(
+    df: pd.DataFrame,
+    metrics: List[str],
+    scope_cols: List[str],
+    group_by: List[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Compute weighted sums for ESG metrics, masking out-of-scope values."""
+    df_out = df.copy()
+
+    # Multiply metrics by weights
+    df_out[metrics] = df_out[metrics].multiply(df_out["weight"], axis="index").astype(float)
+
+    # Mask metrics where scope is False
+    for metric, scope in zip(metrics, scope_cols):
+        df_out.loc[df_out[scope] == False, metric] = np.nan
+
+    # Drop datetime columns (groupby-sum fails with mixed dtypes)
+    df_out = df_out.select_dtypes(exclude=["datetime64[ns]"])
+
+    # Aggregate
+    df_agg = df_out[group_by + metrics].groupby(group_by).sum()[metrics]
+    return df_agg, df_out
+
+
+def _rebase_metrics(
+    df: pd.DataFrame,
+    lRebased: List[str],
+    lRebasedScope: List[str],
+    group_by: List[str],
+) -> pd.DataFrame:
+    """Rebase rebased metrics by coverage rate."""
+    df_rebase = df.copy()
+
+    for metric, scope in zip(lRebased, lRebasedScope):
+        df_rebase.loc[df_rebase[scope] == False, metric] = np.nan
+
+    df_rebase = df_rebase.set_index(group_by)
+    coverage = (
+        df_rebase[lRebased].notnull()
+        .multiply(df_rebase["weight"], axis="index")
+        .groupby(level=list(range(len(group_by))))
+        .sum()
+    )
+    return coverage
+
+
+def calc_weighted_average_esg_new(
+    dfPortfolio: pd.DataFrame,
+    lRebased: List[str],
+    lRebasedScope: List[str],
+    lUnrebased: List[str],
+    lUnrebasedScope: List[str],
+    sGroupBy: List[str],
+    iLookthrough: bool = False,
+    use_equal_weights: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Calculate weighted average ESG scores with optional lookthrough.
+
+    Returns:
+        dfOutAgg: Aggregated weighted averages per group.
+        dfOut: Row-level portfolio with weighted metrics applied.
+        dfPortfolio: Original portfolio (possibly modified with lookthrough logic).
+    """
+    if iLookthrough:
+        dfPortfolio = _apply_lookthrough(dfPortfolio, lRebased, lRebasedScope, lUnrebased, lUnrebasedScope)
+
+    # All metrics
+    metrics = lRebased + lUnrebased
+    scope_cols = lRebasedScope + lUnrebasedScope
+
+    # Weighted sums
+    dfOutAgg, dfOut = _compute_weighted_sums(dfPortfolio, metrics, scope_cols, sGroupBy)
+
+    # Rebasing
+    coverage = _rebase_metrics(dfPortfolio, lRebased, lRebasedScope, sGroupBy)
+    dfOutAgg[lRebased] = dfOutAgg[lRebased] / coverage[lRebased]
+
+    # Equal-weight alternative
+    if use_equal_weights:
+        raise NotImplementedError("Equal-weight logic not yet migrated from legacy block.")
+
     return dfOutAgg, dfOut, dfPortfolio
    
-# merge functions
-def merge_esg_data_new(dfPortfolios,dfESGIn,sVariables,sESGSuffix,iWaterfall=False,sLeftOn='ID_BB_COMPANY',sRightOn='ID_BB_COMPANY',sScope = 'Scope'):
-    
-    dfPortfolio = dfPortfolios.copy()
-    dfESG = dfESGIn.copy(deep = True)
-    dfESG.rename(columns = {'id_bb_company':'ID_BB_COMPANY'},inplace = True)
-    
-    
-    if sVariables is not None:
-        # keep only ID and data in right data set
-        dfESG = dfESG[[sRightOn]+sVariables]
-        # drop data if already exist in left data set
-        lDrop = [s for s in dfPortfolio.columns if s in sVariables]
-    else:
-        lDrop = []
-    if len(lDrop) > 0:
-        dfPortfolio.drop(lDrop,axis = 1,inplace = True)
-    
-    if sVariables is not None:
-        # drop NA in right data set
-        dfESG.dropna(subset = [sVariables][0],inplace = True)
 
-    
+def _prepare_esg_data(dfESG: pd.DataFrame, sRightOn: str, sVariables: Optional[List[str]]) -> pd.DataFrame:
+    """Prepare ESG dataset: rename, filter variables, drop NAs, validate uniqueness."""
+    dfESG = dfESG.copy(deep=True)
+    dfESG.rename(columns={"id_bb_company": "ID_BB_COMPANY"}, inplace=True)
+
+    if sVariables:
+        dfESG = dfESG[[sRightOn] + sVariables]
+        dfESG.dropna(subset=[sVariables[0]], inplace=True)
+
     if dfESG[sRightOn].nunique() != len(dfESG):
-        raise Exception("ESG data set not unique")
-    
+        raise ValueError("ESG dataset is not unique by right key")
 
-    if iWaterfall ==False:
-        if sESGSuffix == '_FH':
-            dfOut = pd.merge(dfPortfolio,dfESG,how = 'left',left_on = sLeftOn,right_on = sRightOn, suffixes = ('',sESGSuffix), validate = 'm:1')
-            dfOut['FH'] = False
-            dfOut.loc[(dfOut.Sovereigns == 1)&(dfOut.status == 1),'FH'] = True
-            dfOut['status'] = dfOut['FH']
-            dfOut.loc[dfOut[sScope]==False,'status'] = np.nan
-            
-            dfOut['status'] = np.where(dfOut['status'].isnull(), 
-                                                          pd.NA,
-                                                          np.where(dfOut['status']==1., 
-                                                                   True, 
-                                                                   False))
-            dfOut['status'] = dfOut['status'].fillna(value = np.nan)
-        
+    return dfESG
+
+
+def _merge_esg_core(
+    dfPortfolio: pd.DataFrame,
+    dfESG: pd.DataFrame,
+    sVariables: Optional[List[str]],
+    sESGSuffix: str,
+    iWaterfall: bool,
+    sLeftOn: str,
+    sRightOn: str,
+    sScope: str,
+) -> pd.DataFrame:
+    """Perform the core merge depending on waterfall or direct join."""
+    if not iWaterfall:
+        if sVariables:
+            dfOut = pd.merge(
+                dfPortfolio,
+                dfESG.assign(Scope=True),
+                how="left",
+                left_on=[sScope, sLeftOn],
+                right_on=["Scope", sRightOn],
+                suffixes=("", sESGSuffix),
+                validate="m:1",
+            )
         else:
-            lDrop = [s for s in dfPortfolio.columns if s == 'Scope' + sESGSuffix]
-            if len(lDrop) > 0:
-                dfPortfolio.drop(lDrop,axis = 1,inplace = True)
-            if sVariables is not None:
-                dfOut = pd.merge(dfPortfolio,dfESG.assign(Scope = True),how = 'left',left_on = [sScope, sLeftOn], right_on = ['Scope', sRightOn],suffixes=('', sESGSuffix),validate = 'm:1')     
-            else:
-                dfOut = pd.merge(dfPortfolio,dfESG.assign(Scope = True),how = 'left',left_on = [sScope, sLeftOn], right_on = ['Scope', sRightOn],suffixes=('', sESGSuffix),indicator = 'Exposure'+sESGSuffix,validate = 'm:1')
-                dfOut['Exposure'+sESGSuffix] = dfOut['Exposure'+sESGSuffix].map({'both': True, 'left_only': False})
-                dfOut.loc[dfOut[sScope] == False,'Exposure'+sESGSuffix] = np.nan
+            dfOut = pd.merge(
+                dfPortfolio,
+                dfESG.assign(Scope=True),
+                how="left",
+                left_on=[sScope, sLeftOn],
+                right_on=["Scope", sRightOn],
+                suffixes=("", sESGSuffix),
+                indicator="Exposure" + sESGSuffix,
+                validate="m:1",
+            )
+            dfOut["Exposure" + sESGSuffix] = dfOut["Exposure" + sESGSuffix].map({"both": True, "left_only": False})
+            dfOut.loc[dfOut[sScope] == False, "Exposure" + sESGSuffix] = np.nan
     else:
-        dfOut = calc_waterfall(dfPortfolio,dfESG,sESGSuffix+'_used')
-        lDrop = [s for s in dfOut.columns if s == 'Scope' + sESGSuffix]
-        
-        if len(lDrop) > 0:
-            dfOut.drop(lDrop,axis = 1,inplace = True)
-        if sVariables is not None:
-            dfOut = pd.merge(dfOut,dfESG.assign(Scope = True),how = 'left',left_on = [sScope,sLeftOn+sESGSuffix+'_used'],right_on = ['Scope', sRightOn],suffixes=('', sESGSuffix),validate = 'm:1')
-        else:
-            dfOut = pd.merge(dfOut,dfESG.assign(Scope = True),how = 'left',left_on = [sScope,sLeftOn+sESGSuffix+'_used'],right_on = ['Scope', sRightOn],suffixes=('', sESGSuffix),indicator = 'Exposure'+sESGSuffix,validate = 'm:1')
-            dfOut['Exposure'+sESGSuffix] = dfOut['Exposure'+sESGSuffix].map({'both': True, 'left_only': False})
-            dfOut.loc[dfOut[sScope] == False,'Exposure'+sESGSuffix] = np.nan
-        
-        lDrop = [s for s in dfOut.columns if s == 'ID_BB_COMPANY' + sESGSuffix]
-        dfOut.drop(lDrop,axis = 1,inplace = True)
-    
-    if sESGSuffix == '_GB':
-            dfOut.loc[(dfOut['Exposure_GB'] == 1)&(dfOut['dnsh_flag_overall'] == False),'sustainable_investment_share_pre_dnsh']= 1
-            dfOut.loc[(dfOut['Exposure_GB'] == 1)&(dfOut['dnsh_flag_overall'] == False),'sustainable_investment_share_post_dnsh']= 1
-            # dfOut.loc[(dfOut['Exposure_GB'] == 1)&(dfOut['DNSH_FLAG_OVERALL_CURRENT'] == False),'SIS_currentPC_CURRENT']= 1
-            # dfOut.loc[(dfOut['Exposure_GB'] == 1)&(dfOut['DNSH_FLAG_OVERALL_CURRENT'] == False),'SIS_newPC_CURRENT']= 1
-            # dfOut.loc[(dfOut['Exposure_GB'] == 1)&(dfOut['DNSH_FLAG_OVERALL_COMBO'] == False),'SIS_newPC_COMBO']= 1
-    
-    if sVariables == ['GREEN_BOND_LOAN_INDICATOR']:
-            dfOut.loc[(dfOut['GREEN_BOND_LOAN_INDICATOR'] == 1)&(dfOut['dnsh_flag_overall'] == False),'sustainable_investment_share_environmental_post_dnsh']= 1
-            dfOut.loc[(dfOut['GREEN_BOND_LOAN_INDICATOR'] == 1)&(dfOut['dnsh_flag_overall'] == False),'sustainable_investment_share_social_post_dnsh']= 0
+        # waterfall case
+        dfOut = calc_waterfall(dfPortfolio, dfESG, sESGSuffix + "_used")
+        merge_key = sLeftOn + sESGSuffix + "_used"
 
-    if sVariables == ['SOCIAL_BOND_IND']:
-            dfOut.loc[(dfOut['SOCIAL_BOND_IND'] == 1)&(dfOut['dnsh_flag_overall'] == False),'sustainable_investment_share_social_post_dnsh']= 1
-            dfOut.loc[(dfOut['SOCIAL_BOND_IND'] == 1)&(dfOut['dnsh_flag_overall'] == False),'sustainable_investment_share_environmental_post_dnsh']= 0
-            
-    if sVariables == ['SUSTAINABILITY_BOND_IND']:
-            dfOut.loc[(dfOut['SUSTAINABILITY_BOND_IND'] == 1)&(dfOut['dnsh_flag_overall'] == False),'sustainable_investment_share_social_post_dnsh']= 0.5
-            dfOut.loc[(dfOut['SUSTAINABILITY_BOND_IND'] == 1)&(dfOut['dnsh_flag_overall'] == False),'sustainable_investment_share_environmental_post_dnsh']= 0.5
-
-    if sVariables == ['CO2_Engaged']:
-            dfOut['CO2_Engaged'] = 0
-            dfOut.loc[dfOut['Exposure_Eng'] == True,'CO2_Engaged'] = dfOut['carbon_emissions_scope_12']
-
-    if sESGSuffix == '_Ex':
-            lVars = dfESG.drop(['ID_BB_COMPANY'],axis = 1).columns.to_list()
-            dfOut[lVars] = dfOut[lVars].fillna(False)
-
-    if sESGSuffix == '_Comp':
-            dfOut['Exposure_Comp'] = dfOut[['Exposure_BS','status']].max(axis = 1)
-
-        
+        dfOut = pd.merge(
+            dfOut,
+            dfESG.assign(Scope=True),
+            how="left",
+            left_on=[sScope, merge_key],
+            right_on=["Scope", sRightOn],
+            suffixes=("", sESGSuffix),
+            validate="m:1",
+        )
     return dfOut
+
+
+def _apply_suffix_logic(dfOut: pd.DataFrame, sESGSuffix: str, sVariables: Optional[List[str]]) -> pd.DataFrame:
+    """Post-processing depending on ESG suffix or variable."""
+    if sESGSuffix == "_FH":
+        dfOut["FH"] = (dfOut["Sovereigns"] == 1) & (dfOut["status"] == 1)
+        dfOut["status"] = np.where(dfOut["FH"], True, np.where(dfOut["Scope"] == False, np.nan, False))
+
+    elif sESGSuffix == "_GB":
+        mask = (dfOut["Exposure_GB"] == 1) & (dfOut["dnsh_flag_overall"] == False)
+        dfOut.loc[mask, ["sustainable_investment_share_pre_dnsh", "sustainable_investment_share_post_dnsh"]] = 1
+
+    elif sVariables == ["GREEN_BOND_LOAN_INDICATOR"]:
+        mask = (dfOut["GREEN_BOND_LOAN_INDICATOR"] == 1) & (dfOut["dnsh_flag_overall"] == False)
+        dfOut.loc[mask, ["sustainable_investment_share_environmental_post_dnsh"]] = 1
+        dfOut.loc[mask, ["sustainable_investment_share_social_post_dnsh"]] = 0
+
+    elif sVariables == ["SOCIAL_BOND_IND"]:
+        mask = (dfOut["SOCIAL_BOND_IND"] == 1) & (dfOut["dnsh_flag_overall"] == False)
+        dfOut.loc[mask, ["sustainable_investment_share_social_post_dnsh"]] = 1
+        dfOut.loc[mask, ["sustainable_investment_share_environmental_post_dnsh"]] = 0
+
+    elif sVariables == ["SUSTAINABILITY_BOND_IND"]:
+        mask = (dfOut["SUSTAINABILITY_BOND_IND"] == 1) & (dfOut["dnsh_flag_overall"] == False)
+        dfOut.loc[mask, ["sustainable_investment_share_social_post_dnsh"]] = 0.5
+        dfOut.loc[mask, ["sustainable_investment_share_environmental_post_dnsh"]] = 0.5
+
+    elif sVariables == ["CO2_Engaged"]:
+        dfOut["CO2_Engaged"] = 0
+        dfOut.loc[dfOut["Exposure_Eng"] == True, "CO2_Engaged"] = dfOut["carbon_emissions_scope_12"]
+
+    elif sESGSuffix == "_Ex":
+        dfOut[dfOut.columns.difference(["ID_BB_COMPANY"])] = dfOut.drop(columns=["ID_BB_COMPANY"]).fillna(False)
+
+    elif sESGSuffix == "_Comp":
+        dfOut["Exposure_Comp"] = dfOut[["Exposure_BS", "status"]].max(axis=1)
+
+    return dfOut
+
+
+def merge_esg_data_new(
+    dfPortfolios: pd.DataFrame,
+    dfESGIn: pd.DataFrame,
+    sVariables: Optional[List[str]],
+    sESGSuffix: str,
+    iWaterfall: bool = False,
+    sLeftOn: str = "ID_BB_COMPANY",
+    sRightOn: str = "ID_BB_COMPANY",
+    sScope: str = "Scope",
+) -> pd.DataFrame:
+    """
+    Merge portfolio data with ESG dataset, applying suffix-specific post-processing.
+    """
+    dfPortfolio = dfPortfolios.copy()
+    dfESG = _prepare_esg_data(dfESGIn, sRightOn, sVariables)
+    dfOut = _merge_esg_core(dfPortfolio, dfESG, sVariables, sESGSuffix, iWaterfall, sLeftOn, sRightOn, sScope)
+    dfOut = _apply_suffix_logic(dfOut, sESGSuffix, sVariables)
+    return dfOut
+
 
 def calc_new_variables(dfPortfolios):
     dfPortfolios['Uncovered_Issuer_AGI Custom ESMA PAB Results - 2024 November_exSRI'] = False
@@ -1577,159 +1766,275 @@ def calc_new_variables(dfPortfolios):
     # dfPortfolios['Scope'] = dfPortfolios['Scope_Corp']
     return dfPortfolios
 
-def calc_waterfall(dfPortfolio,dfESG,sESGSuffix):
-    dfOut                                           = dfPortfolio.copy()
-    dfOut['ID_BB_COMPANY'+sESGSuffix]               = dfOut['ID_BB_COMPANY'].mask(~dfOut.ID_BB_COMPANY.isin(dfESG.ID_BB_COMPANY))
-    dfOut['ID_BB_PARENT_CO'+sESGSuffix]             = dfOut['ID_BB_PARENT_CO'].mask(~dfOut.ID_BB_PARENT_CO.isin(dfESG.ID_BB_COMPANY))
-    dfOut['ID_BB_ULTIMATE_PARENT_CO'+sESGSuffix]    = dfOut['ID_BB_ULTIMATE_PARENT_CO'].mask(~dfOut.ID_BB_ULTIMATE_PARENT_CO.isin(dfESG.ID_BB_COMPANY))
-    
-    dfOut['ID_BB_COMPANY' + sESGSuffix]             = dfOut['ID_BB_COMPANY'+sESGSuffix].fillna(dfOut['ID_BB_PARENT_CO'+sESGSuffix]).fillna(dfOut['ID_BB_ULTIMATE_PARENT_CO'+sESGSuffix])
-    return dfOut.drop(['ID_BB_PARENT_CO'+sESGSuffix,'ID_BB_ULTIMATE_PARENT_CO'+sESGSuffix],axis = 1)
+def calc_waterfall(
+    dfPortfolio: pd.DataFrame,
+    dfESG: pd.DataFrame,
+    sESGSuffix: str,
+    hierarchy_cols: list[str] = None
+) -> pd.DataFrame:
+    """
+    Apply a waterfall match: start with company, fall back to parent, then ultimate parent.
 
-# load holdings
-def load_portfolio_benchmark_bridge(lPortfolioID):
-    sql = """
-    SELECT b.portfolio_id,
-       b.portfolio_name AS portfolio_benchmark_group_name,
-       a.benchmark_durable_key,
-       c.benchmark_name
-    FROM   """ + lib_utils.dictDremio['dfPortfolioBenchmarkBridge'] + """ a
-    LEFT JOIN """ + lib_utils.dictDremio['dfPortfolioDim'] + """ b
-              ON a.portfolio_durable_key = b.portfolio_durable_key
-    LEFT JOIN """ + lib_utils.dictDremio['dfBenchmarkDim'] + """ c
-              ON a.benchmark_durable_key = c.benchmark_durable_key
-    WHERE  b.is_current = true
-       AND c.is_current = true  """
-    dfBenchmarkBridge           = pd.read_sql(sql,lib_utils.conndremio)
-    dfBenchmarkBridge           = dfBenchmarkBridge.loc[dfBenchmarkBridge.portfolio_id.isin(lPortfolioID)]
-    return dfBenchmarkBridge
-
-def _load_dremio_holdings(lPortfolioIDs, sDate, position_type = 4, iBenchmarks = False, split_ids = None):
-    """Function loads the holdings from Dremio
-    
     Args:
-    portfolio_IDs (int, string, list)... Specification of the portfolio identifiers (CEDAR Portfolio ID) that should be loaded. Provide either single identifier or a list/tuple of identifiers
-    date (str)... Format yyyy-mm-dd, Date for which the holdings should be extracted
-    lib_utils.conn_dremio (lib_utils.connection object)... lib_utils.connection to Database Dremio Production (Tables used: holding_fact, security_master_dim, portfolio_dim)
-    position_type (int from 1 to 5)... Position type from GIDP, according to following logic 
-                                1 - Settled view, End of Day    
-                                2 - Settled view, Start of Day
-                                3 - Traded view, Start of Day
-                                4 - Traded view, End of Day     (default)
-                                5 - Traded view, Month End      (filled only for the last month)
-    
-    
+        dfPortfolio: Portfolio dataframe with issuer hierarchy columns.
+        dfESG: ESG dataframe with available IDs.
+        sESGSuffix: Suffix to append to generated ID columns.
+        hierarchy_cols: Ordered list of columns to use in the fallback hierarchy.
+                        Defaults to company → parent → ultimate parent.
+
     Returns:
-    dfHoldings (pd.DataFrame)... Dataframe containing the Holdings for the portfolio_ids based on DAL data 
+        pd.DataFrame: Portfolio dataframe with resolved ESG IDs.
     """
- 
-    
-    if len(lPortfolioIDs) == 1:
-        lPortfolioID = '(''{}'')'.format(str(lPortfolioIDs[0]))
-    else:
-        lPortfolioID = str(tuple(lPortfolioIDs))
+    if hierarchy_cols is None:
+        hierarchy_cols = [
+            "ID_BB_COMPANY",
+            "ID_BB_PARENT_CO",
+            "ID_BB_ULTIMATE_PARENT_CO",
+        ]
 
-    if len(sDate)>1:
-        date = str(tuple(sDate))
-    else:
-        #date = '({})'.format(str(date[0]))
-        date = "('" + sDate[0] + "')"
-    query = """SELECT h.effective_date,
-       'Fund'                                             AS portfolio_type,
-       p.portfolio_durable_key,
-       p.portfolio_id,
-       p.portfolio_name,
-       p.gidp_reporting_location,
-       --p.prod_line_name_long,
-       p.investment_region,
-       p.sri_esg,
-       p.asset_class,
-       p.investment_approach,
-       p.market_cap,
-       n.market_value_clean_portfolio,
-       n.market_value_clean_firm,
-       n.portfolio_currency_code,
-       v.eu_sfdr_sustainability_category,
-       v.internal_asset_class,
-       v.domicile,
-       h.holding_type,
-       h.percentage_of_market_value_clean_portfolio / 100 AS weight,
-       h.futures_exposure_firm/n.market_value_clean_firm as futures_exposure_firm,
-       s.country_issue_name,
-       e.country_name,
-       e.country_code3,
-       s.currency_traded,
-       'NA' as ml_high_yield_sector,
-       s.agi_instrument_asset_type_description,
-       s.security_durable_key,
-       s.id_underlying_durable_key,
-       s.issuer_long_name,
-       s.long_name,
-       s.agi_instrument_type_description,
-       g.GICS as gics_sector_description,
-       bics.BICS as bics_sector_description,
-       b3.BICS as bics_l3_description,
-       b4.BBG as BBG_l2_description,
-       s.collat_type,
+    dfOut = dfPortfolio.copy()
+    valid_ids = set(dfESG["ID_BB_COMPANY"].dropna().unique())
 
-       'NA' as gics_industry_group_description,
-       'NA' as gics_industry_description,
-       s.bloomberg_security_typ,
-       s.id_isin,
-       s.id_cusip,
-       s.security_des,
-       s.issue_description,
-       s.issuer_id_bloomberg_company                      AS ID_BB_COMPANY
-    FROM """ + lib_utils.dictDremio['dfHoldings'] + """ h
-    JOIN """ + lib_utils.dictDremio['dfPortfolioDim'] + """ p
-         ON p.portfolio_durable_key = h.portfolio_durable_key
-    LEFT JOIN """ + lib_utils.dictDremio['dfSecurityMasterDim'] + """ s
-              ON s.security_durable_key = h.security_durable_key
-                 AND s.is_current = True
-    LEFT JOIN """ + lib_utils.dictDremio['dfCountryDim'] + """ e
-              ON s.country_issue = e.country_code
-    LEFT JOIN """ + lib_utils.dictDremio['dfPortfolioTotal'] + """ n
-              ON p.portfolio_durable_key = n.portfolio_durable_key
-                 AND n.date_key = h.date_key
-                 AND n.position_type_key = h.position_type_key
-    LEFT JOIN """ + lib_utils.dictDremio['dfVehicleDim'] + """ v
-              ON p.portfolio_durable_key = v.portfolio_durable_key
-                 AND v.is_current = True
-                 AND v.vehicle_type_level = 'vehicle'
-    LEFT JOIN (
-        SELECT distinct a.security_durable_key, l1_desc as GICS FROM """ + lib_utils.dictDremio['dfSecuritySector'] + """ a 
-        left join """ + lib_utils.dictDremio['dfSecurityMaster'] + """ b on a.security_durable_key = b.security_durable_key
-        where a.sector_scheme = 'IDS_GICS' and a.is_current = True and a.security_durable_key is not null
-        ) g on s.security_durable_key = g.security_durable_key
-    LEFT JOIN (
-        SELECT distinct a.security_durable_key, l1_desc as BICS FROM """ + lib_utils.dictDremio['dfSecuritySector'] + """ a 
-        left join """ + lib_utils.dictDremio['dfSecurityMaster'] + """ b on a.security_durable_key = b.security_durable_key
-        where a.sector_scheme = 'IDS_BICS' and a.is_current = True and a.security_durable_key is not null
-        ) bics on s.security_durable_key = bics.security_durable_key
-    LEFT JOIN ( SELECT distinct a.security_durable_key, l3_desc as BICS FROM """ + lib_utils.dictDremio['dfSecuritySector'] + """ a 
-        left join """ + lib_utils.dictDremio['dfSecurityMaster'] + """ b on a.security_durable_key = b.security_durable_key
-        where a.sector_scheme = 'IDS_BICS' and a.is_current = True and a.security_durable_key is not null ) b3 
-        on s.security_durable_key = b3.security_durable_key
-     LEFT JOIN ( SELECT distinct a.security_durable_key, l2_desc as BBG FROM """ + lib_utils.dictDremio['dfSecuritySector'] + """ a 
-        left join """ + lib_utils.dictDremio['dfSecurityMaster'] + """ b on a.security_durable_key = b.security_durable_key
-        where a.sector_scheme = 'IDS_BBG' and a.is_current = True and a.security_durable_key is not null ) b4
-        on s.security_durable_key = b4.security_durable_key
-    WHERE  h.effective_date IN """ + date + """
-       AND p.portfolio_id IN """ + str(lPortfolioID) + """
-       AND h.position_type_key = """ + str(position_type) + """
-       AND p.is_current = True
-       AND p.cluster_type <> 'Operations-Only Portfolio'
-       -- excludes all Feeder, Client-Advised, etc. 
-       AND p.portfolio_status <> 'Terminated'
-       -- excludes all Terminated portfolios
-       AND p.hierarchy_type NOT IN ( 'Void' ) -- excludes all Sub Portfolios or Void (used for Terminated)
+    temp_cols = []
+    for col in hierarchy_cols:
+        temp_col = f"{col}{sESGSuffix}"
+        dfOut[temp_col] = dfOut[col].mask(~dfOut[col].isin(valid_ids))
+        temp_cols.append(temp_col)
+
+    # Final waterfall result: take first non-null across hierarchy
+    dfOut[f"ID_BB_COMPANY{sESGSuffix}"] = dfOut[temp_cols].bfill(axis=1).iloc[:, 0]
+
+    # Drop intermediate temp cols
+    dfOut = dfOut.drop(columns=temp_cols[1:])  # keep the final "ID_BB_COMPANY_suffix"
+
+    return dfOut
+# load holdings
+def load_portfolio_benchmark_bridge(
+    lPortfolioID: List[int],
+    con=lib_utils.conndremio,
+    dictDremio: dict = lib_utils.dictDremio,
+) -> pd.DataFrame:
     """
+    Load benchmark bridge data for given portfolio IDs.
+
+    Args:
+        lPortfolioID: List of portfolio IDs to filter.
+        con: Database connection (default: lib_utils.conndremio).
+        dictDremio: Dictionary mapping dataset names to table paths.
+
+    Returns:
+        DataFrame with portfolio-to-benchmark mappings.
+    """
+    if not lPortfolioID:
+        logger.warning("No portfolio IDs provided. Returning empty DataFrame.")
+        return pd.DataFrame()
+
+    # Build parameterized query for safety
+    placeholders = ",".join(["%s"] * len(lPortfolioID))
+    sql = f"""
+        SELECT b.portfolio_id,
+               b.portfolio_name AS portfolio_benchmark_group_name,
+               a.benchmark_durable_key,
+               c.benchmark_name
+        FROM   {dictDremio['dfPortfolioBenchmarkBridge']} a
+        LEFT JOIN {dictDremio['dfPortfolioDim']} b
+               ON a.portfolio_durable_key = b.portfolio_durable_key
+        LEFT JOIN {dictDremio['dfBenchmarkDim']} c
+               ON a.benchmark_durable_key = c.benchmark_durable_key
+        WHERE  b.is_current = TRUE
+          AND  c.is_current = TRUE
+          AND  b.portfolio_id IN ({placeholders})
+    """
+
+    logger.debug("Executing SQL for portfolio benchmark bridge", extra={"sql": sql, "ids": lPortfolioID})
+
+    df = pd.read_sql(sql, con, params=lPortfolioID)
+
+    return df
+
+# -----------------------------
+# Small helpers
+# -----------------------------
+
+def _build_in_clause(values: Union[Iterable, int, str]) -> str:
+    """
+    Build a SQL IN (...) clause list for ints/strings/dates.
+    Example: ["2024-01-01", "2024-01-02"] -> "('2024-01-01','2024-01-02')"
+             [1, 2] -> "(1, 2)"
+    """
+    if not isinstance(values, (list, tuple, set)):
+        values = [values]
+
+    vals: List[str] = []
+    for v in values:
+        if v is None:
+            continue
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            vals.append(str(int(v)))
+        else:
+            s = str(v).replace("'", "''")  # rudimentary escaping for quotes
+            vals.append(f"'{s}'")
+    if not vals:
+        # Avoid invalid SQL like IN ()
+        vals = ["NULL"]
+    return f"({', '.join(vals)})"
+
+
+# You provided this in another snippet; assumed available:
+# def load_portfolio_benchmark_bridge(lPortfolioID): ...
+
+# You also referenced these objects from lib_utils:
+# - lib_utils.conndremio (DB connection)
+# - lib_utils.dictDremio (table map)
+# - lib_utils.dfHierarchy (BBG company hierarchy)
+# - lib_utils.dfCountry, lib_utils.dfSecurities (for XLS enrichment)
+# - lib_utils.EQ_FI_SPLIT_IDS (config for sleeve splitting)
+# - split_eq_fi_sleeves(...) (function), assumed available
+
+
+# -----------------------------
+# Holdings (portfolios)
+# -----------------------------
+
+def _load_dremio_holdings(
+    lPortfolioIDs: Sequence[Union[int, str]],
+    sDate: Sequence[str],
+    position_type: int = 4,
+    iBenchmarks: bool = False,
+    split_ids: Optional[dict] = None,
+) -> Union[pd.DataFrame, Tuple[pd.DataFrame, pd.DataFrame]]:
+    """
+    Load portfolio holdings from Dremio (DAL).
+
+    Args:
+        lPortfolioIDs: List of CEDAR portfolio_ids.
+        sDate: One or more 'YYYY-MM-DD' dates.
+        position_type: GIDP position type key (1..5). Default 4 = Traded/EOD.
+        iBenchmarks: If True, also return the benchmark bridge as second DataFrame.
+        split_ids: Optional split config passed to split_eq_fi_sleeves.
+
+    Returns:
+        dfHoldings or (dfHoldings, dfBenchmarkBridge) if iBenchmarks=True
+    """
+    ids_clause = _build_in_clause(lPortfolioIDs)
+    dates_clause = _build_in_clause(sDate)
+
+    query = f"""
+    SELECT
+        h.effective_date,
+        'Fund' AS portfolio_type,
+        p.portfolio_durable_key,
+        p.portfolio_id,
+        p.portfolio_name,
+        p.gidp_reporting_location,
+        -- p.prod_line_name_long,
+        p.investment_region,
+        p.sri_esg,
+        p.asset_class,
+        p.investment_approach,
+        p.market_cap,
+        n.market_value_clean_portfolio,
+        n.market_value_clean_firm,
+        n.portfolio_currency_code,
+        v.eu_sfdr_sustainability_category,
+        v.internal_asset_class,
+        v.domicile,
+        h.holding_type,
+        h.percentage_of_market_value_clean_portfolio / 100 AS weight,
+        h.futures_exposure_firm / n.market_value_clean_firm AS futures_exposure_firm,
+        s.country_issue_name,
+        e.country_name,
+        e.country_code3,
+        s.currency_traded,
+        'NA' AS ml_high_yield_sector,
+        s.agi_instrument_asset_type_description,
+        s.security_durable_key,
+        s.id_underlying_durable_key,
+        s.issuer_long_name,
+        s.long_name,
+        s.agi_instrument_type_description,
+        g.GICS AS gics_sector_description,
+        bics.BICS AS bics_sector_description,
+        b3.BICS AS bics_l3_description,
+        b4.BBG AS BBG_l2_description,
+        s.collat_type,
+        'NA' AS gics_industry_group_description,
+        'NA' AS gics_industry_description,
+        s.bloomberg_security_typ,
+        s.id_isin,
+        s.id_cusip,
+        s.security_des,
+        s.issue_description,
+        s.issuer_id_bloomberg_company AS ID_BB_COMPANY
+    FROM {lib_utils.dictDremio['dfHoldings']} h
+    JOIN {lib_utils.dictDremio['dfPortfolioDim']} p
+      ON p.portfolio_durable_key = h.portfolio_durable_key
+    LEFT JOIN {lib_utils.dictDremio['dfSecurityMasterDim']} s
+      ON s.security_durable_key = h.security_durable_key
+     AND s.is_current = TRUE
+    LEFT JOIN {lib_utils.dictDremio['dfCountryDim']} e
+      ON s.country_issue = e.country_code
+    LEFT JOIN {lib_utils.dictDremio['dfPortfolioTotal']} n
+      ON p.portfolio_durable_key = n.portfolio_durable_key
+     AND n.date_key = h.date_key
+     AND n.position_type_key = h.position_type_key
+    LEFT JOIN {lib_utils.dictDremio['dfVehicleDim']} v
+      ON p.portfolio_durable_key = v.portfolio_durable_key
+     AND v.is_current = TRUE
+     AND v.vehicle_type_level = 'vehicle'
+    LEFT JOIN (
+        SELECT DISTINCT a.security_durable_key, l1_desc AS GICS
+        FROM {lib_utils.dictDremio['dfSecuritySector']} a
+        LEFT JOIN {lib_utils.dictDremio['dfSecurityMaster']} b
+          ON a.security_durable_key = b.security_durable_key
+        WHERE a.sector_scheme = 'IDS_GICS'
+          AND a.is_current = TRUE
+          AND a.security_durable_key IS NOT NULL
+    ) g ON s.security_durable_key = g.security_durable_key
+    LEFT JOIN (
+        SELECT DISTINCT a.security_durable_key, l1_desc AS BICS
+        FROM {lib_utils.dictDremio['dfSecuritySector']} a
+        LEFT JOIN {lib_utils.dictDremio['dfSecurityMaster']} b
+          ON a.security_durable_key = b.security_durable_key
+        WHERE a.sector_scheme = 'IDS_BICS'
+          AND a.is_current = TRUE
+          AND a.security_durable_key IS NOT NULL
+    ) bics ON s.security_durable_key = bics.security_durable_key
+    LEFT JOIN (
+        SELECT DISTINCT a.security_durable_key, l3_desc AS BICS
+        FROM {lib_utils.dictDremio['dfSecuritySector']} a
+        LEFT JOIN {lib_utils.dictDremio['dfSecurityMaster']} b
+          ON a.security_durable_key = b.security_durable_key
+        WHERE a.sector_scheme = 'IDS_BICS'
+          AND a.is_current = TRUE
+          AND a.security_durable_key IS NOT NULL
+    ) b3 ON s.security_durable_key = b3.security_durable_key
+    LEFT JOIN (
+        SELECT DISTINCT a.security_durable_key, l2_desc AS BBG
+        FROM {lib_utils.dictDremio['dfSecuritySector']} a
+        LEFT JOIN {lib_utils.dictDremio['dfSecurityMaster']} b
+          ON a.security_durable_key = b.security_durable_key
+        WHERE a.sector_scheme = 'IDS_BBG'
+          AND a.is_current = TRUE
+          AND a.security_durable_key IS NOT NULL
+    ) b4 ON s.security_durable_key = b4.security_durable_key
+    WHERE h.effective_date IN {dates_clause}
+      AND p.portfolio_id IN {ids_clause}
+      AND h.position_type_key = {position_type}
+      AND p.is_current = TRUE
+      AND p.cluster_type <> 'Operations-Only Portfolio'
+      AND p.portfolio_status <> 'Terminated'
+      AND p.hierarchy_type NOT IN ('Void')
+    """
+
     print('*********************************************')
-    print('Loading holdings data as of ' + date + '...')
+    print('Loading holdings data as of', dates_clause, '...')
     print('*********************************************')
     print(query)
+
     dfHoldings = pd.read_sql(query, lib_utils.conndremio)
 
+    # Attach benchmark bridge and (optionally) fetch benchmark legs
     dfBenchmarkBridge = load_portfolio_benchmark_bridge(lPortfolioIDs)
 
     if len(dfBenchmarkBridge) > 0:
@@ -1737,821 +2042,1198 @@ def _load_dremio_holdings(lPortfolioIDs, sDate, position_type = 4, iBenchmarks =
             dfHoldings,
             dfBenchmarkBridge,
             how="left",
-            left_on="portfolio_id",
-            right_on="portfolio_id",
+            on="portfolio_id",
             validate="m:1",
         )
         dfHoldings["benchmark_id"] = dfHoldings["benchmark_durable_key"]
         dfHoldings = dfHoldings.drop(columns=["benchmark_durable_key"], errors="ignore")
+
         lBenchmarkIDs = dfBenchmarkBridge.benchmark_durable_key.drop_duplicates().to_list()
-
         if len(lBenchmarkIDs) == 1:
-            lBenchmarkIDs = lBenchmarkIDs[0]
+            lBenchmarkIDs = [lBenchmarkIDs[0]]
 
-
-        dfAllBenchmarks = load_holdings("benchmark", lBenchmarkIDs, sDate, position_type=1)
+        # Fetch benchmark holdings and append
+        dfAllBenchmarks = _load_benchmark_holdings(lBenchmarkIDs, sDate)
         dfAllBenchmarks["portfolio_id"] = dfAllBenchmarks["benchmark_id"]
-        dfHoldings = pd.concat([dfHoldings, dfAllBenchmarks])
+        dfHoldings = pd.concat([dfHoldings, dfAllBenchmarks], ignore_index=True)
 
-
+    # Enrich with hierarchy
     dfHoldings = pd.merge(
         dfHoldings,
         lib_utils.dfHierarchy,
         how="left",
-        left_on="ID_BB_COMPANY",
-        right_on="ID_BB_COMPANY",
+        on="ID_BB_COMPANY",
         validate="m:1",
     )
 
-
+    # Optional sleeve split
     if split_ids is None:
         split_ids = lib_utils.EQ_FI_SPLIT_IDS
     if split_ids:
         dfHoldings = split_eq_fi_sleeves(dfHoldings, split_ids)
 
-    if iBenchmarks == True:
+    if iBenchmarks:
         return dfHoldings, dfBenchmarkBridge
-    else:
-        return dfHoldings
+    return dfHoldings
 
-def _load_benchmark_holdings(ids, sDate, position_type = 'C'):
-    """Function loads the Benchmark holdings from Dremio
-    
-    Args:
-    portfolio_durable_keys (int, string, list)... Specification of the portfolio identifiers (portfolio_durable_key) for which benchmark data should be loaded. Provide either single identifier or a list/tuple of identifiers
-    date (str)... Format yyyy-mm-dd, Date for which the holdings should be extracted
-    lib_utils.conn_dremio (lib_utils.connection object)... lib_utils.connection to Database Dremio Production (Tables used: holding_fact, security_master_dim, portfolio_dim)
-    position_type (str 'O' or 'C')... Position type from Benchmark holdings, according to following logic 
-                                C - weights from close    (default)
-                                O - weights from open
-    
-    
-    Returns:
-    dfBMKHoldings (pd.DataFrame)... Dataframe containing the Holdings for the Benchmarks related to the portfolio_durable_keys based on DAL data 
+
+# -----------------------------
+# Benchmarks
+# -----------------------------
+
+def _load_benchmark_holdings(
+    ids: Union[int, Sequence[int]],
+    sDate: Sequence[str],
+    position_type: str = "C",
+) -> pd.DataFrame:
     """
-    if isinstance(ids,int):
-        ids = '(''{}'')'.format(str(ids))
-    else:
-        ids = str(tuple(ids))
+    Load benchmark holdings from Dremio.
 
-    if len(sDate)>1:
-        date = str(tuple(sDate))
-    else:
-        #date = '({})'.format(str(date[0]))
-        date = "('" + sDate[0] + "')"
+    Args:
+        ids: One or more benchmark_durable_key values.
+        sDate: One or more 'YYYY-MM-DD' dates.
+        position_type: 'C' (close) or 'O' (open). (The current DAL field used is weight_close.)
 
-    query = """
-    SELECT cast(d.full_date AS DATE)                   AS effective_date,
-       'Benchmark'                   AS portfolio_type,
-       'benchmark_durable_key'       AS durable_key_type,
-       b.benchmark_durable_key       AS durable_key,
-       'benchmark_key'               AS key_type,
-       b.benchmark_key               AS key,
-       b.benchmark_durable_key       AS benchmark_id,
-       b.benchmark_name              AS portfolio_name,
-       b.benchmark_name              AS benchmark_name,
-       b.class                       AS asset_class,
-       s.country_issue_name,
-       e.country_name,
-       e.country_code3,
-       s.currency_traded,
-       'NA' as ml_high_yield_sector,
-       s.agi_instrument_asset_type_description,
-       s.security_durable_key,
-       s.long_name,
-       s.issuer_long_name,
-       s.agi_instrument_type_description,
-       g.GICS as gics_sector_description,
-       bics.BICS as bics_sector_description,
-       b3.BICS as bics_l3_description,
-       b4.BBG as BBG_l2_description,
-       s.collat_type,
-       'NA' as gics_industry_group_description,
-       'NA' as gics_industry_description,
-       s.bloomberg_security_typ,
-       s.id_isin,
-       s.id_cusip,
-       s.security_des,
-       s.issue_description,
-       s.issuer_id_bloomberg_company AS ID_BB_COMPANY,
-       h.weight_close / 100          weight
-    FROM """ + lib_utils.dictDremio['dfBenchmarkConst'] + """ h
-    JOIN """ + lib_utils.dictDremio['dfBenchmarkDim'] + """ b
-         ON b.benchmark_durable_key = h.benchmark_durable_key
-            AND b.is_current = True
-    JOIN """ + lib_utils.dictDremio['dfDateDim'] + """ d
-         ON h.date_key = d.date_key
-    LEFT JOIN """ + lib_utils.dictDremio['dfSecurityMasterDim'] + """ s
-              ON s.security_durable_key = h.security_durable_key
-                 AND s.is_current = True
-    LEFT JOIN """ + lib_utils.dictDremio['dfCountryDim'] + """ e
-              ON e.country_code = s.country_issue 
+    Returns:
+        DataFrame of benchmark holdings.
+    """
+    ids_clause = _build_in_clause(ids)
+    dates_clause = _build_in_clause(sDate)
+
+    query = f"""
+    SELECT
+        CAST(d.full_date AS DATE) AS effective_date,
+        'Benchmark' AS portfolio_type,
+        'benchmark_durable_key' AS durable_key_type,
+        b.benchmark_durable_key AS durable_key,
+        'benchmark_key' AS key_type,
+        b.benchmark_key AS key,
+        b.benchmark_durable_key AS benchmark_id,
+        b.benchmark_name AS portfolio_name,
+        b.benchmark_name AS benchmark_name,
+        b.class AS asset_class,
+        s.country_issue_name,
+        e.country_name,
+        e.country_code3,
+        s.currency_traded,
+        'NA' AS ml_high_yield_sector,
+        s.agi_instrument_asset_type_description,
+        s.security_durable_key,
+        s.long_name,
+        s.issuer_long_name,
+        s.agi_instrument_type_description,
+        g.GICS AS gics_sector_description,
+        bics.BICS AS bics_sector_description,
+        b3.BICS AS bics_l3_description,
+        b4.BBG AS BBG_l2_description,
+        s.collat_type,
+        'NA' AS gics_industry_group_description,
+        'NA' AS gics_industry_description,
+        s.bloomberg_security_typ,
+        s.id_isin,
+        s.id_cusip,
+        s.security_des,
+        s.issue_description,
+        s.issuer_id_bloomberg_company AS ID_BB_COMPANY,
+        h.weight_close / 100 AS weight
+    FROM {lib_utils.dictDremio['dfBenchmarkConst']} h
+    JOIN {lib_utils.dictDremio['dfBenchmarkDim']} b
+      ON b.benchmark_durable_key = h.benchmark_durable_key
+     AND b.is_current = TRUE
+    JOIN {lib_utils.dictDremio['dfDateDim']} d
+      ON h.date_key = d.date_key
+    LEFT JOIN {lib_utils.dictDremio['dfSecurityMasterDim']} s
+      ON s.security_durable_key = h.security_durable_key
+     AND s.is_current = TRUE
+    LEFT JOIN {lib_utils.dictDremio['dfCountryDim']} e
+      ON e.country_code = s.country_issue
     LEFT JOIN (
-        SELECT distinct a.security_durable_key, l1_desc as GICS FROM """ + lib_utils.dictDremio['dfSecuritySector'] + """ a 
-        left join """ + lib_utils.dictDremio['dfSecurityMaster'] + """ b on a.security_durable_key = b.security_durable_key
-        where a.sector_scheme = 'IDS_GICS' and a.is_current = True and a.security_durable_key is not null
-        ) g on s.security_durable_key = g.security_durable_key
+        SELECT DISTINCT a.security_durable_key, l1_desc AS GICS
+        FROM {lib_utils.dictDremio['dfSecuritySector']} a
+        LEFT JOIN {lib_utils.dictDremio['dfSecurityMaster']} b
+          ON a.security_durable_key = b.security_durable_key
+        WHERE a.sector_scheme = 'IDS_GICS'
+          AND a.is_current = TRUE
+          AND a.security_durable_key IS NOT NULL
+    ) g ON s.security_durable_key = g.security_durable_key
     LEFT JOIN (
-        SELECT distinct a.security_durable_key, l1_desc as BICS FROM """ + lib_utils.dictDremio['dfSecuritySector'] + """ a 
-        left join """ + lib_utils.dictDremio['dfSecurityMaster'] + """ b on a.security_durable_key = b.security_durable_key
-        where a.sector_scheme = 'IDS_BICS' and a.is_current = True and a.security_durable_key is not null
-        ) bics on s.security_durable_key = bics.security_durable_key
-    LEFT JOIN ( SELECT distinct a.security_durable_key, l3_desc as BICS FROM """ + lib_utils.dictDremio['dfSecuritySector'] + """ a 
-        left join """ + lib_utils.dictDremio['dfSecurityMaster'] + """ b on a.security_durable_key = b.security_durable_key
-        where a.sector_scheme = 'IDS_BICS' and a.is_current = True and a.security_durable_key is not null ) b3 
-        on s.security_durable_key = b3.security_durable_key
-     LEFT JOIN ( SELECT distinct a.security_durable_key, l2_desc as BBG FROM """ + lib_utils.dictDremio['dfSecuritySector'] + """ a 
-        left join """ + lib_utils.dictDremio['dfSecurityMaster'] + """ b on a.security_durable_key = b.security_durable_key
-        where a.sector_scheme = 'IDS_BBG' and a.is_current = True and a.security_durable_key is not null ) b4 
-        on s.security_durable_key = b4.security_durable_key   
-    WHERE h.benchmark_durable_key in """ + ids + """
-       AND cast(d.full_date AS DATE) in """ + date 
-    #
+        SELECT DISTINCT a.security_durable_key, l1_desc AS BICS
+        FROM {lib_utils.dictDremio['dfSecuritySector']} a
+        LEFT JOIN {lib_utils.dictDremio['dfSecurityMaster']} b
+          ON a.security_durable_key = b.security_durable_key
+        WHERE a.sector_scheme = 'IDS_BICS'
+          AND a.is_current = TRUE
+          AND a.security_durable_key IS NOT NULL
+    ) bics ON s.security_durable_key = bics.security_durable_key
+    LEFT JOIN (
+        SELECT DISTINCT a.security_durable_key, l3_desc AS BICS
+        FROM {lib_utils.dictDremio['dfSecuritySector']} a
+        LEFT JOIN {lib_utils.dictDremio['dfSecurityMaster']} b
+          ON a.security_durable_key = b.security_durable_key
+        WHERE a.sector_scheme = 'IDS_BICS'
+          AND a.is_current = TRUE
+          AND a.security_durable_key IS NOT NULL
+    ) b3 ON s.security_durable_key = b3.security_durable_key
+    LEFT JOIN (
+        SELECT DISTINCT a.security_durable_key, l2_desc AS BBG
+        FROM {lib_utils.dictDremio['dfSecuritySector']} a
+        LEFT JOIN {lib_utils.dictDremio['dfSecurityMaster']} b
+          ON a.security_durable_key = b.security_durable_key
+        WHERE a.sector_scheme = 'IDS_BBG'
+          AND a.is_current = TRUE
+          AND a.security_durable_key IS NOT NULL
+    ) b4 ON s.security_durable_key = b4.security_durable_key
+    WHERE h.benchmark_durable_key IN {ids_clause}
+      AND CAST(d.full_date AS DATE) IN {dates_clause}
+    """
+
     print('*********************************************')
-    print('Loading benchmark data as of ' + date + '...')
+    print('Loading benchmark data as of', dates_clause, '...')
     print('*********************************************')
     print(query)
+
     dfBMKHoldings = pd.read_sql(query, lib_utils.conndremio)
     return dfBMKHoldings
 
-def _load_index_holdings(ids, sDate, position_type = 'C'):
-    """Function loads the Benchmark holdings from Dremio
-    
-    Args:
-    portfolio_durable_keys (int, string, list)... Specification of the portfolio identifiers (portfolio_durable_key) for which benchmark data should be loaded. Provide either single identifier or a list/tuple of identifiers
-    date (str)... Format yyyy-mm-dd, Date for which the holdings should be extracted
-    lib_utils.conn_dremio (lib_utils.connection object)... lib_utils.connection to Database Dremio Production (Tables used: holding_fact, security_master_dim, portfolio_dim)
-    position_type (str 'O' or 'C')... Position type from Benchmark holdings, according to following logic 
-                                C - weights from close    (default)
-                                O - weights from open
-    
-    
-    Returns:
-    dfBMKHoldings (pd.DataFrame)... Dataframe containing the Holdings for the Benchmarks related to the portfolio_durable_keys based on DAL data 
+
+# -----------------------------
+# Indexes
+# -----------------------------
+
+def _load_index_holdings(
+    ids: Sequence[int],
+    sDate: Sequence[str],
+    position_type: str = "C",
+) -> pd.DataFrame:
     """
-    if len(ids) == 1:
-        ids = '(''{}'')'.format(str(ids[0]))
-    else:
-        ids = str(tuple(ids))
-    
-    # if isinstance(ids,int):
-    #     ids = '(''{}'')'.format(str(ids))
-    # else:
-    #     ids = str(tuple(ids))
-        
-    if len(sDate)>1:
-        date = str(tuple(sDate))
-    else:
-        #date = '({})'.format(str(date[0]))
-        date = "('" + sDate[0] + "')"
-        
-    query = """
-    SELECT cast(d.full_date AS DATE)                         AS effective_date,
-       'Index'                             AS portfolio_type,
-       'index_durable_key'                 AS durable_key_type,
-       b.index_durable_key                 AS durable_key,
-       'index_key'                         AS key_type,
-       b.index_durable_key                 AS portfolio_id,
-       -b.index_durable_key                AS benchmark_id,
-       b.index_name                        AS portfolio_name,
-       b.index_cdve_code,
-       b.market_sector_des                 AS asset_class,
-       s.country_issue_name,
-       e.country_name,
-       e.country_code3,
-       s.currency_traded,
-       'NA' as ml_high_yield_sector,
-       s.agi_instrument_asset_type_description,
-       s.security_durable_key,
-       s.long_name,
-       s.issuer_long_name,
-       s.agi_instrument_type_description,
-       g.GICS as gics_sector_description,
-       bics.BICS as bics_sector_description,
-       b3.BICS as bics_l3_description,
-       b4.BBG as BBG_l2_description,
-       s.collat_type,
-       'NA' as gics_industry_group_description,
-       'NA' as gics_industry_description,
-       s.bloomberg_security_typ,
-       s.id_isin,
-       s.id_cusip,
-       s.security_des,
-       s.issue_description,
-       s.issuer_id_bloomberg_company       AS ID_BB_COMPANY,
-       h.constituent_weight_in_index / 100 AS weight
-    FROM """ + lib_utils.dictDremio['dfIndexConst'] + """ h
-    JOIN """ + lib_utils.dictDremio['dfIndexDim'] + """  b
-         ON h.index_durable_key = b.index_durable_key
-            AND b.is_current = true
-    JOIN """ + lib_utils.dictDremio['dfDateDim'] + """ d
-         ON d.date_key = h.date_key
-    LEFT JOIN """ + lib_utils.dictDremio['dfSecurityMasterDim'] + """ s
-              ON s.security_durable_key = h.security_durable_key
-                 AND s.is_current = true
-    LEFT JOIN """ + lib_utils.dictDremio['dfCountryDim'] + """ e
-              ON s.country_issue = e.country_code 
+    Load index holdings from Dremio.
+
+    Args:
+        ids: One or more index_durable_key values.
+        sDate: One or more 'YYYY-MM-DD' dates.
+        position_type: 'C' or 'O' (current DAL uses close weights).
+
+    Returns:
+        DataFrame of index holdings.
+    """
+    ids_clause = _build_in_clause(ids)
+    dates_clause = _build_in_clause(sDate)
+
+    query = f"""
+    SELECT
+        CAST(d.full_date AS DATE) AS effective_date,
+        'Index' AS portfolio_type,
+        'index_durable_key' AS durable_key_type,
+        b.index_durable_key AS durable_key,
+        'index_key' AS key_type,
+        b.index_durable_key AS portfolio_id,
+        -b.index_durable_key AS benchmark_id,
+        b.index_name AS portfolio_name,
+        b.index_cdve_code,
+        b.market_sector_des AS asset_class,
+        s.country_issue_name,
+        e.country_name,
+        e.country_code3,
+        s.currency_traded,
+        'NA' AS ml_high_yield_sector,
+        s.agi_instrument_asset_type_description,
+        s.security_durable_key,
+        s.long_name,
+        s.issuer_long_name,
+        s.agi_instrument_type_description,
+        g.GICS AS gics_sector_description,
+        bics.BICS AS bics_sector_description,
+        b3.BICS AS bics_l3_description,
+        b4.BBG AS BBG_l2_description,
+        s.collat_type,
+        'NA' AS gics_industry_group_description,
+        'NA' AS gics_industry_description,
+        s.bloomberg_security_typ,
+        s.id_isin,
+        s.id_cusip,
+        s.security_des,
+        s.issue_description,
+        s.issuer_id_bloomberg_company AS ID_BB_COMPANY,
+        h.constituent_weight_in_index / 100 AS weight
+    FROM {lib_utils.dictDremio['dfIndexConst']} h
+    JOIN {lib_utils.dictDremio['dfIndexDim']} b
+      ON h.index_durable_key = b.index_durable_key
+     AND b.is_current = TRUE
+    JOIN {lib_utils.dictDremio['dfDateDim']} d
+      ON d.date_key = h.date_key
+    LEFT JOIN {lib_utils.dictDremio['dfSecurityMasterDim']} s
+      ON s.security_durable_key = h.security_durable_key
+     AND s.is_current = TRUE
+    LEFT JOIN {lib_utils.dictDremio['dfCountryDim']} e
+      ON s.country_issue = e.country_code
     LEFT JOIN (
-        SELECT distinct a.security_durable_key, l1_desc as GICS FROM """ + lib_utils.dictDremio['dfSecuritySector'] + """ a 
-        left join """ + lib_utils.dictDremio['dfSecurityMaster'] + """ b on a.security_durable_key = b.security_durable_key
-        where a.sector_scheme = 'IDS_GICS' and a.is_current = True and a.security_durable_key is not null
-        ) g on s.security_durable_key = g.security_durable_key
+        SELECT DISTINCT a.security_durable_key, l1_desc AS GICS
+        FROM {lib_utils.dictDremio['dfSecuritySector']} a
+        LEFT JOIN {lib_utils.dictDremio['dfSecurityMaster']} b
+          ON a.security_durable_key = b.security_durable_key
+        WHERE a.sector_scheme = 'IDS_GICS'
+          AND a.is_current = TRUE
+          AND a.security_durable_key IS NOT NULL
+    ) g ON s.security_durable_key = g.security_durable_key
     LEFT JOIN (
-        SELECT distinct a.security_durable_key, l1_desc as BICS FROM """ + lib_utils.dictDremio['dfSecuritySector'] + """ a 
-        left join """ + lib_utils.dictDremio['dfSecurityMaster'] + """ b on a.security_durable_key = b.security_durable_key
-        where a.sector_scheme = 'IDS_BICS' and a.is_current = True and a.security_durable_key is not null
-        ) bics on s.security_durable_key = bics.security_durable_key
-    LEFT JOIN ( SELECT distinct a.security_durable_key, l3_desc as BICS FROM """ + lib_utils.dictDremio['dfSecuritySector'] + """ a 
-        left join """ + lib_utils.dictDremio['dfSecurityMaster'] + """ b on a.security_durable_key = b.security_durable_key
-        where a.sector_scheme = 'IDS_BICS' and a.is_current = True and a.security_durable_key is not null ) b3 
-        on s.security_durable_key = b3.security_durable_key
-    LEFT JOIN ( SELECT distinct a.security_durable_key, l2_desc as BBG FROM """ + lib_utils.dictDremio['dfSecuritySector'] + """ a 
-        left join """ + lib_utils.dictDremio['dfSecurityMaster'] + """ b on a.security_durable_key = b.security_durable_key
-        where a.sector_scheme = 'IDS_BBG' and a.is_current = True and a.security_durable_key is not null ) b4
-        on s.security_durable_key = b4.security_durable_key
-   WHERE h.index_durable_key in """ + ids + """ and cast(d.full_date AS DATE) in """ + date
+        SELECT DISTINCT a.security_durable_key, l1_desc AS BICS
+        FROM {lib_utils.dictDremio['dfSecuritySector']} a
+        LEFT JOIN {lib_utils.dictDremio['dfSecurityMaster']} b
+          ON a.security_durable_key = b.security_durable_key
+        WHERE a.sector_scheme = 'IDS_BICS'
+          AND a.is_current = TRUE
+          AND a.security_durable_key IS NOT NULL
+    ) bics ON s.security_durable_key = bics.security_durable_key
+    LEFT JOIN (
+        SELECT DISTINCT a.security_durable_key, l3_desc AS BICS
+        FROM {lib_utils.dictDremio['dfSecuritySector']} a
+        LEFT JOIN {lib_utils.dictDremio['dfSecurityMaster']} b
+          ON a.security_durable_key = b.security_durable_key
+        WHERE a.sector_scheme = 'IDS_BICS'
+          AND a.is_current = TRUE
+          AND a.security_durable_key IS NOT NULL
+    ) b3 ON s.security_durable_key = b3.security_durable_key
+    LEFT JOIN (
+        SELECT DISTINCT a.security_durable_key, l2_desc AS BBG
+        FROM {lib_utils.dictDremio['dfSecuritySector']} a
+        LEFT JOIN {lib_utils.dictDremio['dfSecurityMaster']} b
+          ON a.security_durable_key = b.security_durable_key
+        WHERE a.sector_scheme = 'IDS_BBG'
+          AND a.is_current = TRUE
+          AND a.security_durable_key IS NOT NULL
+    ) b4 ON s.security_durable_key = b4.security_durable_key
+    WHERE h.index_durable_key IN {ids_clause}
+      AND CAST(d.full_date AS DATE) IN {dates_clause}
+    """
+
     print('*********************************************')
-    print('Loading index holdings as of '+ date + '...')
+    print('Loading index holdings as of', dates_clause, '...')
     print('*********************************************')
     print(query)
 
-    dfBMKHoldings = pd.read_sql(query, lib_utils.conndremio)
-    dfBMKHoldings = pd.merge(
-        dfBMKHoldings,
+    dfIdx = pd.read_sql(query, lib_utils.conndremio)
+    dfIdx = pd.merge(
+        dfIdx,
         lib_utils.dfHierarchy,
         how="left",
-        left_on="ID_BB_COMPANY",
-        right_on="ID_BB_COMPANY",
+        on="ID_BB_COMPANY",
         validate="m:1",
     )
-    return dfBMKHoldings
+    return dfIdx
 
-def _load_xls_portfolio(lDatnames,lBenchmarkNames,lPortfolioTypes,lFolder,sLeftOn = 'id_isin'):
 
+# -----------------------------
+# Custom XLS portfolios
+# -----------------------------
+
+def _load_xls_portfolio(
+    lDatnames: Sequence[str],
+    lBenchmarkNames: Sequence[str],
+    lPortfolioTypes: Sequence[str],
+    lFolder: str,
+    sLeftOn: str = "id_isin",
+) -> pd.DataFrame:
+    """
+    Load custom portfolios from Excel files and enrich with security/country metadata.
+
+    Args:
+        lDatnames: Filenames (within lFolder) of the XLS sources.
+        lBenchmarkNames: Display names (same length as lDatnames).
+        lPortfolioTypes: Types (e.g., 'Universe', 'Benchmark') matching lDatnames.
+        lFolder: Base folder path (ending with / or \\).
+        sLeftOn: 'id_isin' (default) or 'ID_BB_COMPANY'/'issuer_id_bloomberg_company'.
+
+    Returns:
+        Concatenated/enriched DataFrame.
+    """
     print('*********************************************')
     print('Loading customized portfolios...')
     print('*********************************************')
-    i = 0
-    for i in range(len(lDatnames)):
-        dfBenchmark = pd.read_excel(lFolder + lDatnames[i])
-        sBenchmarkName = lBenchmarkNames[i]
-        
-        dfBenchmark['Benchmark'] = sBenchmarkName
-        dfBenchmark['durable_key_type'] = 'xls'
-        dfBenchmark['durable_key'] = lBenchmarkNames[i]
-        dfBenchmark['benchmark_id'] = lDatnames[i]
-        dfBenchmark['portfolio_id'] = lDatnames[i]
-        dfBenchmark['portfolio_name'] = lBenchmarkNames[i]
-        dfBenchmark['portfolio_type'] = lPortfolioTypes[i]
-        
-        if i == 0:
-            dfAllBenchmarks = pd.DataFrame(dfBenchmark)
-        else:
-            dfAllBenchmarks = pd.concat([dfAllBenchmarks,dfBenchmark])   
-    
-    if sLeftOn == 'id_isin':
-        dfAllBenchmarks = pd.merge(dfAllBenchmarks,lib_utils.dfSecurities, how = 'left',left_on = sLeftOn,right_on = 'ID_ISIN',validate = 'm:1')
-        sSecurityDes = 'SECURITY_DES'
-    elif sLeftOn == 'ID_BB_COMPANY' or sLeftOn == 'issuer_id_bloomberg_company':
-        dfAllBenchmarks = pd.merge(dfAllBenchmarks,lib_utils.dfHierarchy, how = 'left',left_on = sLeftOn,right_on = 'ID_BB_COMPANY',validate = 'm:1')
-        sSecurityDes = 'LONG_COMP_NAME'
-    #dfAllBenchmarks.dropna(subset = ['ID_BB_COMPANY'],inplace = True)
-    dfAllBenchmarks['ID_BB_COMPANY'] = dfAllBenchmarks['ID_BB_COMPANY'].astype(float)
-    dfAllBenchmarks['ID_BB_PARENT_CO'] = dfAllBenchmarks['ID_BB_PARENT_CO'].astype(float)
-    dfAllBenchmarks['ID_BB_ULTIMATE_PARENT_CO'] = dfAllBenchmarks['ID_BB_ULTIMATE_PARENT_CO'].astype(float)
-    #dfAllBenchmarks['id_isin'] = dfAllBenchmarks['ID_ISIN']
-    
-    #dfAllBenchmarks['weight'] = dfAllBenchmarks['weight'] / dfAllBenchmarks.groupby('portfolio_name')['weight'].transform('sum')
-    #dfAllBenchmarks['weight'] = dfAllBenchmarks['weight']/100
-    dfAllBenchmarks["issuer_long_name"] = dfAllBenchmarks["LONG_COMP_NAME"]
-    dfAllBenchmarks["long_name"] = dfAllBenchmarks[sSecurityDes]
-    dfAllBenchmarks["gics_sector_description"] = dfAllBenchmarks["INDUSTRY_SECTOR"].str.upper()
 
-    dfAllBenchmarks = pd.merge(
-        dfAllBenchmarks,
-        lib_utils.dfCountry,
-        how="left",
-        left_on="ULT_PARENT_CNTRY_DOMICILE",
-        right_on="country_code",
-        validate="m:1",
-    )
-    dfAllBenchmarks["country_issue_name"] = dfAllBenchmarks["country_name"]
+    dfs: List[pd.DataFrame] = []
+    for datname, bench_name, ptype in zip(lDatnames, lBenchmarkNames, lPortfolioTypes):
+        dfB = pd.read_excel(lFolder + datname)
+        dfB["Benchmark"] = bench_name
+        dfB["durable_key_type"] = "xls"
+        dfB["durable_key"] = bench_name
+        dfB["benchmark_id"] = datname
+        dfB["portfolio_id"] = datname
+        dfB["portfolio_name"] = bench_name
+        dfB["portfolio_type"] = ptype
+        dfs.append(dfB)
+
+    dfAllBenchmarks = pd.concat(dfs, ignore_index=True)
+
+    if sLeftOn == "id_isin":
+        dfAllBenchmarks = pd.merge(
+            dfAllBenchmarks,
+            lib_utils.dfSecurities,
+            how="left",
+            left_on="id_isin",
+            right_on="ID_ISIN",
+            validate="m:1",
+        )
+        sec_des_col = "SECURITY_DES"
+    elif sLeftOn in ("ID_BB_COMPANY", "issuer_id_bloomberg_company"):
+        dfAllBenchmarks = pd.merge(
+            dfAllBenchmarks,
+            lib_utils.dfHierarchy,
+            how="left",
+            left_on=sLeftOn,
+            right_on="ID_BB_COMPANY",
+            validate="m:1",
+        )
+        sec_des_col = "LONG_COMP_NAME"
+    else:
+        raise ValueError("sLeftOn must be 'id_isin' or a BB company id column")
+
+    # Cast ID columns to float as in original function
+    for col in ("ID_BB_COMPANY", "ID_BB_PARENT_CO", "ID_BB_ULTIMATE_PARENT_CO"):
+        if col in dfAllBenchmarks.columns:
+            dfAllBenchmarks[col] = dfAllBenchmarks[col].astype(float)
+
+    dfAllBenchmarks["issuer_long_name"] = dfAllBenchmarks.get("LONG_COMP_NAME", dfAllBenchmarks.get("issuer_long_name"))
+    dfAllBenchmarks["long_name"] = dfAllBenchmarks[sec_des_col] if sec_des_col in dfAllBenchmarks.columns else dfAllBenchmarks.get("long_name")
+    if "INDUSTRY_SECTOR" in dfAllBenchmarks.columns:
+        dfAllBenchmarks["gics_sector_description"] = dfAllBenchmarks["INDUSTRY_SECTOR"].astype(str).str.upper()
+
+    # Country enrichment
+    if "ULT_PARENT_CNTRY_DOMICILE" in dfAllBenchmarks.columns:
+        dfAllBenchmarks = pd.merge(
+            dfAllBenchmarks,
+            lib_utils.dfCountry,
+            how="left",
+            left_on="ULT_PARENT_CNTRY_DOMICILE",
+            right_on="country_code",
+            validate="m:1",
+        )
+        dfAllBenchmarks["country_issue_name"] = dfAllBenchmarks["country_name"]
 
     dfAllBenchmarks.dropna(subset=[sLeftOn], inplace=True)
 
-
     return dfAllBenchmarks
-  
-# AMF minimum standards cat 1 funds
-def calc_corp_eligible_univ(dfPortfolio,iLookthrough = False):
+
+
+def calc_corp_eligible_univ(dfPortfolio: pd.DataFrame, iLookthrough: bool = False):
+    """
+    Classify portfolio holdings into corporate eligible universe and other categories.
+
+    Args:
+        dfPortfolio: DataFrame with security holdings, must include columns like:
+            ['bloomberg_security_typ','agi_instrument_type_description',
+             'agi_instrument_asset_type_description','gics_sector_description',
+             'ml_high_yield_sector','id_cusip','benchmark_id']
+        iLookthrough: If True, funds are treated as eligible lookthrough assets.
+
+    Returns:
+        dfPortfolio (with new classification columns),
+        dfClassification (unique combinations of attributes for corporates),
+        lSovTypes (list of sovereign instrument type descriptions)
+    """
+
+    # --- constants ---
+    lSolidarityAssetCUSIPs = [
+        'PP30KWR12','PPE9EMHU7','PPE1399U4','PP9I7DSD7',
+        'PPE60EWP0','PPE83X7U8','PP9FDPE51','PPE1EGPJ3','PPE0AN3Y5'
+    ]
+
+    lSovTypes = [
+        'Debts / Bonds / Fixed / Government',
+        'Debts / Bonds / Variable / Government',
+        'Debts / Bonds / Zero / Government',
+        'Debts / MM / Fixed / Government',
+        'Debts / MM / Variable / Government',
+        'Debts / MM / Zero / Government',
+        'Debts / MTN / Fixed / Government',
+        'Debts / MTN / Variable / Government',
+        'Debts / MTN / Zero / Government',
+        'Debts / Municipals',
+    ]
+
+    lFundsDerivatives = [
+        'Derivative','Fund','Funds','Futures','Forward','Listed Options',
+        'OTC Options','Swaps','Open End Funds','Interest Rate Swap',
+        'Rights','Certificates','FX Forward','Listed Derivatives',
+        'Credit Default Swap','Futures -Financial','Total Return Swap',
+        'Structured Other','Equity Option','Cash Option','Commodity Future Option'
+    ]
+
+    # --- normalization / overrides ---
+    df = dfPortfolio.copy()
+
+    df.loc[
+        (df.bloomberg_security_typ.isin(['Unit','Stapled Security'])) &
+        (df.agi_instrument_type_description == 'Funds'),
+        'agi_instrument_asset_type_description'
+    ] = 'Equities'
+
+    df.loc[
+        df.agi_instrument_type_description == 'Funds / REIT',
+        'agi_instrument_asset_type_description'
+    ] = 'Equities'
+
+    # --- boolean flags ---
+    df['Cash'] = df['agi_instrument_asset_type_description'].isin([
+        'Referential Instruments','Cash','Cash Equivalent','Not Available','Account'
+    ])
+
+    df['Private Equity'] = df['bloomberg_security_typ'].eq('Private Eqty')
+    df['Funds and Derivatives'] = df['agi_instrument_asset_type_description'].isin(lFundsDerivatives)
+    df['Real Estate'] = df['agi_instrument_asset_type_description'].isin(['Real Estate','Mortgage'])
+    df['Loan'] = df['agi_instrument_asset_type_description'].eq('Loan')
+    df['sov1'] = df['ml_high_yield_sector'].isin(['QGVT','SOV'])
+    df['sov2'] = df['agi_instrument_type_description'].isin(lSovTypes)
+    df['sov3'] = df['agi_instrument_asset_type_description'].isin(['Government','Treas','Sovereign'])
+
+    # gics override for sov3
+    df.loc[df['gics_sector_description'].str.upper() == 'GOVERNMENT', 'sov3'] = True
+
+    # aggregate sov
+    df['Sovereigns'] = df[['sov1','sov2','sov3']].max(axis=1)
+    df['Scope_Sov'] = df['Sovereigns']
+
+    # solidarity list
+    df['Solidarities'] = df['id_cusip'].isin(lSolidarityAssetCUSIPs)
+
+    # eligible corporates = NOT in any excluded asset class
+    exclusions = ['Cash','Funds and Derivatives','Sovereigns','Solidarities','Private Equity','Real Estate','Loan']
+    df['Corporates eligible assets'] = ~df[exclusions].max(axis=1).astype(bool)
+
+    # --- overrides ---
+    # real estate funds can be eligible
+    df.loc[
+        (df.gics_sector_description.isin(['REAL ESTATE','Real Estate'])) &
+        (df.agi_instrument_asset_type_description == 'Funds'),
+        'Corporates eligible assets'
+    ] = True
+
+    # specific benchmarks allow sovereigns as eligible
+    df.loc[
+        (df.benchmark_id.isin([-344,166,94795])) &
+        (df.Sovereigns == True),
+        'Corporates eligible assets'
+    ] = True
+
+    # --- scopes ---
+    df['Scope_Corp'] = df['Corporates eligible assets']
+    df['Scope_NAV'] = True
+    df['Scope_Inv'] = ~df[['Cash','Funds and Derivatives']].max(axis=1).astype(bool)
+
+    # lookthrough funds if requested
+    if iLookthrough:
+        mask_funds = df['agi_instrument_asset_type_description'] == 'Funds'
+        df.loc[mask_funds, ['Scope','Scope_Inv','Scope_Corp']] = True
+
+    # --- check table for unique classification combos ---
+    dfClassification = (
+        df.loc[df['Corporates eligible assets'] == True,
+               ['agi_instrument_asset_type_description','agi_instrument_type_description',
+                'ml_high_yield_sector','bloomberg_security_typ']]
+          .drop_duplicates()
+    )
+
+    return df, dfClassification, lSovTypes
+
+def item_positions(lItems, lList):
+    """Return indices of all items in lList that are in lItems."""
+    return [i for i, val in enumerate(lList) if val in lItems]
+
+def strip_tz_from_object_cols(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove timezone info from datetime-like columns (object or datetime64[ns, tz])."""
     
-    lSolidarityAssetCUSIPs = 	['PP30KWR12','PPE9EMHU7', 'PPE1399U4', 'PP9I7DSD7','PPE60EWP0','PPE83X7U8','PP9FDPE51','PPE1EGPJ3','PPE0AN3Y5']
-
-    dfPortfolio.loc[(dfPortfolio.bloomberg_security_typ.isin(['Unit','Stapled Security']))&(dfPortfolio.agi_instrument_type_description == 'Funds'),'agi_instrument_asset_type_description'] = 'Equities'
-    dfPortfolio.loc[dfPortfolio.agi_instrument_type_description == 'Funds / REIT','agi_instrument_asset_type_description'] = 'Equities'
-    dfPortfolio['Cash'] = dfPortfolio['agi_instrument_asset_type_description'].isin(['Referential Instruments','Cash','Cash Equivalent','Not Available','Account'])
-    dfPortfolio['Private Equity'] = dfPortfolio['bloomberg_security_typ'].isin(['Private Eqty'])
-    dfPortfolio['Funds and Derivatives'] = dfPortfolio['agi_instrument_asset_type_description'].isin(['Derivative','Fund','Funds','Futures','Forward','Listed Options','OTC Options', 'Swaps','Open End Funds','Interest Rate Swap','Rights','Certificates','FX Forward','Listed Derivatives','Credit Default Swap','Futures -Financial','Total Return Swap','Structured Other','Equity Option','Cash Option','Commodity Future Option'])
-    dfPortfolio['Real Estate'] = dfPortfolio['agi_instrument_asset_type_description'].isin(['Real Estate','Mortgage'])
-    dfPortfolio['Loan'] = dfPortfolio['agi_instrument_asset_type_description'].isin(['Loan'])
-    dfPortfolio['sov1'] = dfPortfolio['ml_high_yield_sector'].isin(['QGVT','SOV'])
-    lSovTypes = ['Debts / Bonds / Fixed / Government',
-    'Debts / Bonds / Fixed / Government',
-    'Debts / Bonds / Variable / Government',
-    'Debts / Bonds / Zero / Government',
-    'Debts / MM / Fixed / Government',
-    'Debts / MM / Variable / Government',
-    'Debts / MM / Zero / Government',
-    'Debts / MTN / Fixed / Government',
-    'Debts / MTN / Variable / Government',
-    'Debts / MTN / Zero / Government',
-    'Debts / Municipals']
-    dfPortfolio['sov2'] = dfPortfolio['agi_instrument_type_description'].isin(lSovTypes)
-    dfPortfolio['sov3'] = dfPortfolio['agi_instrument_asset_type_description'].isin(['Government','Treas','Sovereign'])
-    dfPortfolio.loc[dfPortfolio.gics_sector_description.str.upper() == 'GOVERNMENT','sov3'] = 1
-    #dfPortfolio['sov4'] = dfPortfolio['collat_type'].str.contains('GOVT',na = False)
-    #dfPortfolio['sov4'] = dfPortfolio['BBG_l2_description'].isin(['AGENCIES','TREASURIES','SOVEREIGN','SUPRANATIONAL','LOCAL_AUTHORITIES'])
-
-
-    dfPortfolio['Sovereigns'] = dfPortfolio[['sov1','sov2','sov3']].max(axis = 1)
-    dfPortfolio['Scope_Sov'] = dfPortfolio['Sovereigns']
-    dfPortfolio['Solidarities'] = dfPortfolio['id_cusip'].isin(lSolidarityAssetCUSIPs)
-    dfPortfolio['Corporates eligible assets'] = ~dfPortfolio[['Cash','Funds and Derivatives','Sovereigns','Solidarities','Private Equity','Real Estate','Loan']].max(axis = 1).astype(bool)
-
-    # Overrides    
-    dfPortfolio.loc[(dfPortfolio.gics_sector_description.isin(['REAL ESTATE','Real Estate']))&(dfPortfolio.agi_instrument_asset_type_description == 'Funds'),'Corporates eligible assets'] =  True
-    #dfPortfolio.loc[(dfPortfolio.benchmark_id.isin([-344,166,-1537,94795]))&(dfPortfolio.Sovereigns == True),'Corporates eligible assets'] = True
-    dfPortfolio.loc[(dfPortfolio.benchmark_id.isin([-344,166,94795]))&(dfPortfolio.Sovereigns == True),'Corporates eligible assets'] = True
-
-    # dnsh
-    #lNotEligible = ['Funds','Swaps','Futures','Referential Instruments']
-    #dfPortfolio.loc[dfPortfolio.agi_instrument_asset_type_description.isin(lNotEligible),'Scope'] = False
+    # Handle proper tz-aware datetime64 columns
+    for col in df.select_dtypes(include=["datetimetz"]).columns:
+        df[col] = df[col].dt.tz_localize(None)
     
-    dfPortfolio['Scope_Corp']= dfPortfolio['Corporates eligible assets']
-    dfPortfolio['Scope_NAV'] = True
-    dfPortfolio['Scope_Inv'] = ~dfPortfolio[['Cash','Funds and Derivatives']].max(axis = 1).astype(bool)
-
-    #dfPortfolio.loc[(dfPortfolio.gics_sector_description == 'REAL ESTATE')&(dfPortfolio.agi_instrument_asset_type_description == 'Funds'),'Scope_Inv'] =  True
-
-    
-    if iLookthrough == True:
-        dfPortfolio.loc[dfPortfolio['agi_instrument_asset_type_description'] == 'Funds','Scope'] = True
-        dfPortfolio.loc[dfPortfolio['agi_instrument_asset_type_description'] == 'Funds','Scope_Inv'] = True
-        dfPortfolio.loc[dfPortfolio['agi_instrument_asset_type_description'] == 'Funds','Scope_Corp'] = True
-    
-    #checks:
-    dfClassification = dfPortfolio.loc[dfPortfolio['Corporates eligible assets'] == True][['agi_instrument_asset_type_description','agi_instrument_type_description','ml_high_yield_sector','bloomberg_security_typ']].drop_duplicates()
-    
-    
-
-    return dfPortfolio, dfClassification, lSovTypes
-
-# export
-def item_positions(lItems,lList):
-    #lList = L
-    #lItems = ['Coverage']
-    N = []
-
-    for i in range(len(lList)):
-    
-        if lList[i] in lItems:
-            N.append(i)
-            
-    return N
-
-def strip_tz_from_object_cols(df):
-    for col in df.select_dtypes(include='object').columns:
+    # Handle datetime objects stored in object dtype
+    for col in df.select_dtypes(include="object"):
         if df[col].apply(lambda x: isinstance(x, datetime) and x.tzinfo is not None).any():
-            df[col] = df[col].apply(lambda x: x.replace(tzinfo=None) if isinstance(x, datetime) else x)
+            df[col] = df[col].map(lambda x: x.replace(tzinfo=None) if isinstance(x, datetime) else x)
+    
     return df
 
-def excel_export(usewriterpf,dfExcelExport):
+def excel_export(writer, exports):
+    """
+    Export multiple DataFrames to Excel with formatting.
+
+    Parameters
+    ----------
+    writer : pd.ExcelWriter
+        Open Excel writer (context handled outside).
+    exports : list[dict]
+        Each dict must contain:
+            - data : DataFrame
+            - sSheetName : str
+            - sPctCols, sBars, sWide, sTrueFalse, sFalseTrue, sColsHighlight : list[str] or []
+    """
+    workbook = writer.book
+
+    # Formats
+    fmtpct = workbook.add_format({"num_format": "0.0%"})
+    fmtdcml = workbook.add_format({"num_format": "0.0"})
+    header_fmt = workbook.add_format({
+        "bold": True, "text_wrap": True, "valign": "top", "border": 1
+    })
+    header_fmt_highlight = workbook.add_format({
+        "bold": True, "text_wrap": True, "valign": "top",
+        "fg_color": "#76933C", "border": 1
+    })
+    falsefmt = workbook.add_format({"bg_color": "#FF0000"})
+    truefmt = workbook.add_format({"bg_color": "#FF0000"})
+
+    for export in exports:
+        df = strip_tz_from_object_cols(export["data"]).reset_index(drop=True)
+
+        # Reorder columns
+        a_set = set(lib_utils.lSortColumns)
+        b_set = set(df.columns)
+        srtcols = [*(x for x in lib_utils.lSortColumns if x in b_set),
+                   *(x for x in df.columns if x not in a_set)]
+        df = df.reindex(columns=srtcols)
+
+        sheet = export["sSheetName"]
+        df.to_excel(writer, sheet_name=sheet, freeze_panes=(1, 0), index=False)
+        ws = writer.sheets[sheet]
+
+        # Zoom + autofilter
+        ws.set_zoom(75)
+        ws.autofilter(0, 0, len(df), len(df.columns) - 1)
+
+        # Column list
+        cols = df.columns.tolist()
+
+        # Default decimal format
+        for n, col in enumerate(cols):
+            if col not in lib_utils.lVarListInt:
+                ws.set_column(n, n, None, fmtdcml)
+
+        # Percent columns
+        for n in item_positions(export.get("sPctCols", []), cols):
+            ws.set_column(n, n, None, fmtpct)
+
+        # Wide columns
+        for n in item_positions(export.get("sWide", []), cols):
+            ws.set_column(n, n, 50)
+
+        # Data bars
+        for n in item_positions(export.get("sBars", []), cols):
+            ws.conditional_format(1, n, len(df), n,
+                                  {"type": "data_bar", "bar_border_color": "#1F497D"})
+
+        # Conditional TRUE/FALSE formatting
+        for n in item_positions(export.get("sTrueFalse", []), cols):
+            ws.conditional_format(1, n, len(df), n,
+                                  {"type": "text", "criteria": "containing",
+                                   "value": "FALSE", "format": falsefmt})
+        for n in item_positions(export.get("sFalseTrue", []), cols):
+            ws.conditional_format(1, n, len(df), n,
+                                  {"type": "text", "criteria": "containing",
+                                   "value": "TRUE", "format": truefmt})
+
+        # Header formatting + comments
+        for col_num, col in enumerate(cols):
+            fmt = header_fmt_highlight if col in export.get("sColsHighlight", []) else header_fmt
+            ws.write(0, col_num, col, fmt)
+            if col in lib_utils.dictDefinitions:
+                ws.write_comment(0, col_num, lib_utils.dictDefinitions[col],
+                                 {"x_scale": 1.2, "y_scale": 0.8})
+
+def calc_decimal(df, lColNames):
+    """
+    Divide selected columns by 100 (convert percentages to decimals).
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Input DataFrame.
+    lColNames : list[str]
+        List of column names to transform.
+
+    Returns
+    -------
+    pd.DataFrame
+        Modified DataFrame with decimals.
+    """
+    for col in lColNames:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce") / 100
+    return df
+
+def mylambda(x, lVar):
+    """
+    Custom aggregator: weighted averages, total weight, and unique issuer count.
+    """
+    # Weighted average (ignores NaNs)
+    weighted_avg = np.average(
+        x[lVar].astype(float),
+        weights=x["weight"],
+        axis=0
+    )
+
+    # Wrap into series with suffix
+    result = pd.Series(weighted_avg, index=[f"{col}_wavg" for col in lVar])
+
+    # Add totals
+    result["weight"] = x["weight"].sum()
+    result["issuer"] = x["ID_BB_COMPANY"].nunique()
+
+    return result
 
 
-    with usewriterpf as writerpf:
+def calc_group_average(df, lVar, sGroupVar):
+    """
+    Calculate group-level weighted averages and add an 'All' category.
+    """
+    df[lVar] = df[lVar].astype(float)
+    df[sGroupVar] = df[sGroupVar].fillna("_OTHER")
 
-        for d in dfExcelExport:
-            
-            x=d # dfExcelExport[d]
-            
-            dfRes           = x['data']
-            dfRes           = strip_tz_from_object_cols(dfRes)
-            sSheetName      = x['sSheetName']
-            sPctCols        = x['sPctCols']
-            sBars           = x['sBars']
-            sWide           = x['sWide']
-            sTrueFalse      = x['sTrueFalse']
-            sFalseTrue      = x['sFalseTrue']
-            sColsHighlight  = x['sColsHighlight']
-            
-            a_set = set(lib_utils.lSortColumns)
-            b_set = set(dfRes.columns.to_list())
-            srtcols = [*(x for x in lib_utils.lSortColumns if x in b_set), *(x for x in dfRes.columns.to_list() if x not in a_set)]    
-            dfRes = dfRes.reindex(columns = srtcols)            
-            
-            # list of col headers
-            dfRes = dfRes.reset_index()
+    group_vars = lib_utils.lGroupByVariablesShort + [sGroupVar]
 
-            if 'index' in dfRes:
-                dfRes = dfRes.drop('index', axis = 1)
-            L = dfRes.columns.to_list()
-            # define formats                        
-            workbook  = writerpf.book
+    def _aggregate(subset):
+        return mylambda(subset, lVar)
 
-            fmtpct = workbook.add_format({'num_format': '0.0%'})
-            fmtdcml = workbook.add_format({'num_format': '0.0'})
-            
-            header_format_highlight = workbook.add_format({
-                'bold': True,
-                'text_wrap': True,
-                'valign': 'top',
-                'fg_color': '#76933C',
-                'border': 1})
-            header_format = workbook.add_format({
-                'bold': True,
-                'text_wrap': True,
-                'valign': 'top',
-                'border': 1})
-            falsefmt = workbook.add_format({'bg_color':'#FF0000'})
-            truefmt = workbook.add_format({'bg_color':'#FF0000'})
+    # Regular groups
+    dfRes = df.groupby(group_vars, dropna=False).apply(_aggregate)
+    dfRes["all issuer"] = dfRes.groupby(level=lib_utils.lGroupByVariablesShort)["issuer"].transform("sum")
+    dfRes["issuer_pct"] = dfRes["issuer"] / dfRes["all issuer"]
 
+    # "All" groups
+    dfAll = df.copy()
+    dfAll[sGroupVar] = "All"
+    dfAll = dfAll.groupby(group_vars, dropna=False).apply(_aggregate)
+    dfAll["all issuer"] = dfAll.groupby(level=lib_utils.lGroupByVariablesShort)["issuer"].transform("sum")
+    dfAll["issuer_pct"] = dfAll["issuer"] / dfAll["all issuer"]
 
-            # write
-            #dfRes.to_excel(writerpf,sheet_name = sSheetName,freeze_panes = [1,1],index = False)
-            dfRes.to_excel(writerpf,sheet_name = sSheetName,freeze_panes = [1,0],index = False)
-            
-            # zoom
-            writerpf.sheets[sSheetName].set_zoom(75)
+    # Combine
+    result = (
+        pd.concat([dfRes, dfAll])
+        .reset_index()
+        .sort_values(lib_utils.lGroupByVariablesShort + ["weight"], ascending=False)
+        .drop("all issuer", axis=1)
+    )
 
-            # autofilter
-            writerpf.sheets[sSheetName].autofilter(0, 0, len(dfRes), len(dfRes.columns)-1)
-
-
-
-            # format decimal points
-            for n, value in pd.Series(L).items():
-                if value not in lib_utils.lVarListInt:    
-                    writerpf.sheets[sSheetName].set_column(n,n,None,fmtdcml)
-
-
-            # format columns
-            if sPctCols != False:
-                for n in item_positions(sPctCols,L):
-                    writerpf.sheets[sSheetName].set_column(n,n,None,fmtpct)
-            
-            if sWide != False:
-                for n in item_positions(sWide,L):
-                    writerpf.sheets[sSheetName].set_column(n,n,50)
-            
-            if sBars != False:
-                for n in item_positions(sBars,L):
-                    writerpf.sheets[sSheetName].conditional_format(1, n, len(dfRes), n, {'type': 'data_bar',
-                                                                                             'bar_border_color':'#1F497D'})            
-            
-            if sTrueFalse != False:
-                for n in item_positions(sTrueFalse,L):
-                    writerpf.sheets[sSheetName].conditional_format(1, n, len(dfRes), n, {'type':     'text',
-                                                                                    'criteria': 'containing',
-                                                                                    'value':    'FALSE',
-                                                                                    'format':   falsefmt})            
-            if sFalseTrue != False:
-                for n in item_positions(sFalseTrue,L):
-                    writerpf.sheets[sSheetName].conditional_format(1, n, len(dfRes), n, {'type':     'text',
-                                                                                    'criteria': 'containing',
-                                                                                    'value':    'TRUE',
-                                                                                    'format':   truefmt})  
-            
-            
-            for col_num, value in pd.Series(L).items():
-                writerpf.sheets[sSheetName].write(0, col_num, value, header_format)
-                if value in lib_utils.dictDefinitions:
-                    writerpf.sheets[sSheetName].write_comment(0, col_num, lib_utils.dictDefinitions[value], {'x_scale': 1.2, 'y_scale': 0.8})
-            
-            if sColsHighlight != False:
-                for col_num in item_positions(sColsHighlight,L):
-                    writerpf.sheets[sSheetName].write(0, col_num, pd.Series(L)[col_num], header_format_highlight)
-
-def calc_decimal(dfData,lColNames):
-    for i in lColNames:
-        dfData[i] = dfData[i]/100
-    return dfData
-
-def calc_group_average(dfData,lVar,sGroupVar):
-    dfData[lVar]            = dfData[lVar].astype(float)
-    dfData[sGroupVar]       = dfData[sGroupVar].fillna('_OTHER')
-                       
-    dfRes                   = dfData.groupby(lib_utils.lGroupByVariablesShort + [sGroupVar],dropna=False).apply(lambda x: mylambda(x,lVar))
-    dfRes['all issuer']     = dfRes.groupby(level = lib_utils.lGroupByVariablesShort,dropna=False)['issuer'].transform('sum')
-    dfRes['issuer_pct']     = dfRes['issuer']/dfRes['all issuer']
-
-    dfAll                   = dfData.copy()
-    dfAll[sGroupVar]        = 'All'
-
-    dfAll                   = dfAll.groupby(lib_utils.lGroupByVariablesShort + [sGroupVar],dropna=False).apply(lambda x: mylambda(x,lVar))
-    dfAll['all issuer']     = dfAll.groupby(level = lib_utils.lGroupByVariablesShort,dropna=False)['issuer'].transform('sum')
-    dfAll['issuer_pct']     = dfAll['issuer']/dfAll['all issuer']
-
-    return pd.concat([dfRes,dfAll]).reset_index().sort_values(lib_utils.lGroupByVariablesShort + ['weight'],ascending = False).drop('all issuer',axis = 1)
-    
-def mylambda(x,lVar):
-    
-    #x = test.copy()
-    #lVar = ['PSR_score_final_raw','PSR_score_final_bic']
-    temp = np.ma.average(np.ma.masked_array(x[lVar], np.isnan(x[lVar])),weights=x['weight'],axis = 0)
-    temp = pd.Series(temp,[lVar])
-    temp.index = temp.index.map('_'.join)
-    
-    # weight per group
-    temp2 = np.sum(x['weight'])
-    temp2 = pd.Series(temp2,['weight'])
-    
-    # issuer count
-    temp3 = len(np.unique(x['ID_BB_COMPANY']))
-    temp3 = pd.Series(temp3,['issuer'])
-    
-
-    
-    return pd.concat([pd.concat([temp,temp2]),temp3])
+    return result
 
 def sort_cols(lVarsIn):
-    
-    a_set = set(lib_utils.lSortColumns)
-    b_set = set(lVarsIn)
-    lVarsOut = [*(x for x in lib_utils.lSortColumns if x in b_set), *(x for x in lVarsIn if x not in a_set)]    
-
+    """
+    Reorder columns: first those in lib_utils.lSortColumns (if present),
+    then all remaining in their original order.
+    """
+    lVarsOut = [c for c in lib_utils.lSortColumns if c in lVarsIn]
+    lVarsOut += [c for c in lVarsIn if c not in lib_utils.lSortColumns]
     return lVarsOut
 
-def concat_portfolio_benchmark(dfAllPortfolios,dfBenchmarkBridge):
-    dfOut = []
-    for index, row in dfBenchmarkBridge.iterrows():                
-        print(row['benchmark_durable_key'])
-        print(row['portfolio_id'])
-        dfTemp = pd.concat([dfAllPortfolios.loc[dfAllPortfolios.portfolio_id == row['portfolio_id']],dfAllPortfolios.loc[dfAllPortfolios.portfolio_id == row['benchmark_durable_key']]])
-        dfTemp['portfolio_benchmark_group_name'] = row['portfolio_benchmark_group_name']
-        dfOut.append(dfTemp)
+def concat_portfolio_benchmark(dfAllPortfolios, dfBenchmarkBridge):
+    """
+    Concatenate portfolio and benchmark holdings into groups.
+    
+    Args:
+        dfAllPortfolios (pd.DataFrame): Portfolio and benchmark holdings.
+        dfBenchmarkBridge (pd.DataFrame): Bridge mapping portfolio_id to benchmark_durable_key and group name.
+    
+    Returns:
+        pd.DataFrame: Combined DataFrame with portfolio + benchmark for each group.
+    """
+    out_list = []
+
+    for _, row in dfBenchmarkBridge.iterrows():
+        subset = dfAllPortfolios.loc[
+            dfAllPortfolios["portfolio_id"].isin([row["portfolio_id"], row["benchmark_durable_key"]])
+        ].copy()
+        subset["portfolio_benchmark_group_name"] = row["portfolio_benchmark_group_name"]
+        out_list.append(subset)
+
+    return pd.concat(out_list, ignore_index=True)
+
+def calc_active_weights(dfPfBenchmark, dfBenchmarkBridge, sVar, lVarList):
+    """
+    Calculate active weights and contributions vs. benchmark.
+
+    Args:
+        dfPfBenchmark (pd.DataFrame): Portfolio and benchmark holdings (with 'weight', 'Scope_Corp', etc.).
+        dfBenchmarkBridge (pd.DataFrame): Mapping of portfolios to benchmarks.
+        sVar (str): Variable of interest (numeric column).
+        lVarList (list[str]): List of grouping variables (must include portfolio/benchmark IDs & names).
+
+    Returns:
+        pd.DataFrame: Active weights/contributions with portfolio vs. benchmark diff.
+    """
+    # Keep only corporate scope
+    df = dfPfBenchmark.loc[dfPfBenchmark["Scope_Corp"] == True].copy()
+
+    # Contribution = weight * variable
+    df["contribution"] = df["weight"] * df[sVar]
+
+    # Normalize weights for rows with data (avoid bias from missing sVar)
+    mask = ~df[sVar].isna()
+    df.loc[mask, "adjweight"] = df.loc[mask].groupby(
+        ["portfolio_id", "portfolio_name", "benchmark_id", "benchmark_name"]
+    )["weight"].transform("sum")
+
+    df["contribution"] = df["contribution"] / df["adjweight"]
+
+    # Expand with benchmark groups
+    df = concat_portfolio_benchmark(df, dfBenchmarkBridge)
+
+    # Grouping (sum weights & contributions, mean of sVar)
+    lVarListBench = [s for s in lVarList if s not in ["portfolio_id", "portfolio_name", "benchmark_id", "benchmark_name"]]
+    df = (
+        df.groupby(lVarList, dropna=False)
+          .agg({
+              "weight": lambda x: x.sum(min_count=1),
+              "contribution": lambda x: x.sum(min_count=1),
+              sVar: "mean"
+          })
+          .reset_index()
+    )
+
+    # Pivot Fund vs Benchmark
+    df = (
+        df.groupby(lVarListBench, sort=False, dropna=False)[["weight", "contribution", sVar]]
+          .first()
+          .unstack("portfolio_type")
+    )
+    df.columns = [f"{col[0]}_{col[1]}" for col in df.columns]
+
+    # Fill sVar using fund first, then benchmark
+    df[sVar] = df.get(f"{sVar}_Fund", np.nan).fillna(df.get(f"{sVar}_Benchmark", np.nan))
+
+    # Drop helper columns
+    df = df.drop(columns=[f"{sVar}_Fund", f"{sVar}_Benchmark"], errors="ignore")
+
+    # Active contribution difference
+    df["diff"] = df["contribution_Fund"].fillna(0) - df["contribution_Benchmark"].fillna(0)
+
+    return df
+
+def calc_period_end(period="month", year_start=2018, year_end=2025):
+    """
+    Load period-end dates from Dremio.
+
+    Args:
+        period (str): 'year', 'quarter', or 'month'.
+        year_start (int): First year to include.
+        year_end (int): Last year to include.
+
+    Returns:
+        pd.DataFrame: Period-end dates.
+    """
+    # Map period to SQL month filter
+    if period == "year":
+        month_filter = "12"
+    elif period == "quarter":
+        month_filter = "3,6,9,12"
+    elif period == "month":
+        month_filter = None
+    else:
+        raise ValueError("period must be 'year', 'quarter', or 'month'")
+
+    sql = f"""
+        SELECT * 
+        FROM {lib_utils.dictDremio['dfDateDim']} 
+        WHERE last_business_day_in_month_flag = 'Y'
+          AND "year" BETWEEN {year_start} AND {year_end}
+    """
+
+    if month_filter:
+        sql += f" AND month IN ({month_filter})"
+
+    sql += " ORDER BY full_date DESC"
+
+    return pd.read_sql(sql, lib_utils.conndremio)
+
+def get_names(dfPortfolios, max_api=100):
+    """
+    Fill missing issuer names in portfolios by fetching from Bloomberg API.
+
+    Args:
+        dfPortfolios (pd.DataFrame): Portfolio dataframe with ID_BB_COMPANY and issuer_long_name.
+        max_api (int): Max number of IDs allowed for Bloomberg API call (default=100).
         
-    return pd.concat(dfOut)
-
-def calc_active_weights(dfPfBenchmark,dfBenchmarkBridge,sVar,lVarList):
-    
-    dfPfBenchmark                   = dfPfBenchmark.loc[dfPfBenchmark['Scope_Corp'] == True]
-    
-    #if len(dfPfBenchmark[lVarList + [sVar]].drop_duplicates()) != len(dfPfBenchmark[lVarList].drop_duplicates()):
-    #    raise Exception("ESG data not unique")            
-    
-    
-    dfPfBenchmark['contribution']   = dfPfBenchmark['weight'].multiply(dfPfBenchmark[sVar],axis = 0)
-    
-    dfPfBenchmark.loc[~dfPfBenchmark[sVar].isna(),'adjweight'] = dfPfBenchmark.loc[~dfPfBenchmark[sVar].isna()].groupby(['portfolio_id','portfolio_name','benchmark_id','benchmark_name'])['weight'].transform('sum')
-    
-    dfPfBenchmark['contribution'] = dfPfBenchmark['contribution']/dfPfBenchmark['adjweight']
-    
-    dfPfBenchmark                   = concat_portfolio_benchmark(dfPfBenchmark,dfBenchmarkBridge)    
-
-    lVarListBench                   = [s for s in lVarList if s not in ['portfolio_id','portfolio_name','benchmark_id','benchmark_name']]
-    
-    dfPfBenchmark                   = dfPfBenchmark.groupby(lVarList,
-                                                            dropna=False).agg({'weight':lambda x: x.sum(min_count=1),
-                                                                               'contribution':lambda x: x.sum(min_count=1),
-                                                                               sVar:'mean'}).reset_index()
-    
-                                                                               
-                                                                               
-    dfPfBenchmark                   = dfPfBenchmark.groupby(lVarListBench, 
-                                                            sort=False,
-                                                            dropna=False)[['weight','contribution']+[sVar]].first().unstack('portfolio_type')
-    
-    dfPfBenchmark.columns           = [s1 + '_' + str(s2) for (s1,s2) in dfPfBenchmark.columns.tolist()]
-    
-    dfPfBenchmark[sVar]             = dfPfBenchmark[sVar + '_Fund'].fillna(dfPfBenchmark[sVar + '_Benchmark'])
-    
-    dfPfBenchmark                   = dfPfBenchmark.drop([sVar + '_Fund',sVar + '_Benchmark'],axis = 1)
-    
-    dfPfBenchmark['diff']           = dfPfBenchmark['contribution_Fund'].fillna(0) - dfPfBenchmark['contribution_Benchmark'].fillna(0)
-  
-    return dfPfBenchmark
-
-def calc_yend():
-    sql = """
-    select * from """ + lib_utils.dictDremio['dfDateDim'] + """ where last_business_day_in_month_flag = 'Y' and "month" in (12) and "year" between 2018 and 2024 order by full_date desc
+    Returns:
+        pd.DataFrame: Updated portfolio dataframe with missing issuer names filled.
     """
-    return pd.read_sql(sql,lib_utils.conndremio)
+    # Find missing issuer names
+    lMissings = (
+        dfPortfolios.loc[dfPortfolios['issuer_long_name'].isna(), 'ID_BB_COMPANY']
+        .dropna()
+        .drop_duplicates()
+    )
 
-def calc_qend():
-    sql = """
-    select * from """ + lib_utils.dictDremio['dfDateDim'] + """ where last_business_day_in_month_flag = 'Y' and month in (3,6,9,12) and year between 2018 and 2025 order by full_date desc
-    """
-    return pd.read_sql(sql,lib_utils.conndremio)
+    print("**************************************")
+    print(f"Looking for {len(lMissings)} missing issuer names in Bloomberg...")
+    print("**************************************")
 
-def calc_mend():
-    sql = """
-    select * from """ + lib_utils.dictDremio['dfDateDim'] + """ where last_business_day_in_month_flag = 'Y' and "year" between 2023 and 2024 order by full_date desc
-    """
-    return pd.read_sql(sql,lib_utils.conndremio)
-
-def get_names(dfPortfolios):
-    
-    lMissings = dfPortfolios.loc[dfPortfolios['issuer_long_name'].isna()]['ID_BB_COMPANY'].dropna().drop_duplicates() 
-    print('**************************************')
-    print('Looking for ' + str(len(lMissings)) + ' missing issuer names in bloomberg...')
-    print('**************************************')
-    if len(lMissings) > 100:
-        print('******')
-        print(str(len(lMissings)))
+    if len(lMissings) > max_api:
+        print(f"Too many IDs: {len(lMissings)} (limit {max_api})")
         if os.environ.get("BBG_API_PASSWORD") != "BBG":
-            raise Exception('Not allowed to prevent API freeze')
-    if len(lMissings) > 0:
-        lIDBB = ('/companyid/' + lMissings.astype(str)).to_list()
-        lib_utils.connBBG.start()
-        dfBBG = lib_utils.connBBG.ref(lIDBB, ['LONG_COMP_NAME','COUNTRY_FULL_NAME'])
-        dfBBG['ID_BB_COMPANY'] = dfBBG.ticker.str[11:].astype(float)
-        dfBBG = dfBBG.pivot_table(index = 'ID_BB_COMPANY',columns = 'field', values = 'value',aggfunc='first').reset_index()
-    
-        dfPortfolios = pd.merge(dfPortfolios,dfBBG,how = 'left',left_on = 'ID_BB_COMPANY', right_on = 'ID_BB_COMPANY',validate = 'm:1',suffixes = ('','_BBG'))
-        dfPortfolios['issuer_long_name'] = dfPortfolios['issuer_long_name'].fillna(dfPortfolios['LONG_COMP_NAME_BBG'])
-        dfPortfolios['long_name'] = dfPortfolios['long_name'].fillna(dfPortfolios['LONG_COMP_NAME_BBG'])
-        dfPortfolios['country_issue_name'] = dfPortfolios['country_issue_name'].fillna(dfPortfolios['COUNTRY_FULL_NAME'])
-        
+            raise Exception("Not allowed to prevent API freeze")
+
+    if len(lMissings) == 0:
+        return dfPortfolios  # nothing to do
+
+    # Prepare Bloomberg tickers
+    lIDBB = ("/companyid/" + lMissings.astype(str)).to_list()
+
+    # Fetch from Bloomberg
+    lib_utils.connBBG.start()
+    dfBBG = lib_utils.connBBG.ref(lIDBB, ["LONG_COMP_NAME", "COUNTRY_FULL_NAME"])
+
+    # Extract ID_BB_COMPANY from ticker string
+    dfBBG["ID_BB_COMPANY"] = dfBBG.ticker.str[11:].astype(float)
+
+    # Reshape
+    dfBBG = (
+        dfBBG.pivot_table(
+            index="ID_BB_COMPANY", 
+            columns="field", 
+            values="value", 
+            aggfunc="first"
+        )
+        .reset_index()
+    )
+
+    # Merge back
+    dfPortfolios = pd.merge(
+        dfPortfolios,
+        dfBBG,
+        how="left",
+        on="ID_BB_COMPANY",
+        validate="m:1",
+        suffixes=("", "_BBG"),
+    )
+
+    # Fill missing values
+    dfPortfolios["issuer_long_name"] = dfPortfolios["issuer_long_name"].fillna(dfPortfolios["LONG_COMP_NAME_BBG"])
+    dfPortfolios["long_name"] = dfPortfolios["long_name"].fillna(dfPortfolios["LONG_COMP_NAME_BBG"])
+    dfPortfolios["country_issue_name"] = dfPortfolios["country_issue_name"].fillna(dfPortfolios["COUNTRY_FULL_NAME"])
+
     return dfPortfolios
 
-def search_cedar_vehicles(iRefresh,lIdentifiers = [],sType = []):
-    
-    if iRefresh == True:
-        
-        sql                         = """
-                                select  *
-                                from  """ + lib_utils.dictDremio['dfVehicleDim'] + """ 
-                                where is_current = True
-                                """
-        dfVehicles                      = pd.read_sql(sql,lib_utils.conndremio)
-        dfVehicles.to_pickle(lib_utils.sWorkFolder + 'dfVehicles.pkl')
-        
-    else:
-        dfVehicles = pd.read_pickle(lib_utils.sWorkFolder + 'dfVehicles.pkl')
-    
-    if lIdentifiers:
-        
-        dfVehicles = dfVehicles.loc[dfVehicles[sType].astype(str).str.contains('|'.join(lIdentifiers),na = False)]
-        dfVehicles = dfVehicles.loc[dfVehicles.vehicle_status == 'Active']
-        dfVehicles = dfVehicles.loc[dfVehicles.is_leading_share_class == 'Y']
+import os
 
-                                                                               
+def search_cedar_vehicles(iRefresh, lIdentifiers=None, sType=None):
+    """
+    Search and filter Cedar vehicle data.
+
+    Args:
+        iRefresh (bool): If True, reload from Dremio and overwrite local pickle. 
+                         If False, load cached pickle.
+        lIdentifiers (list, optional): List of identifier patterns to filter on. Default = None.
+        sType (str, optional): Column name to apply identifier filter on. Default = None.
+
+    Returns:
+        pd.DataFrame: Filtered vehicles dataframe.
+    """
+    pkl_path = os.path.join(lib_utils.sWorkFolder, "dfVehicles.pkl")
+
+    # Refresh or load from pickle
+    if iRefresh:
+        sql = f"""
+            SELECT *
+            FROM {lib_utils.dictDremio['dfVehicleDim']}
+            WHERE is_current = True
+        """
+        dfVehicles = pd.read_sql(sql, lib_utils.conndremio)
+        dfVehicles.to_pickle(pkl_path)
+    else:
+        dfVehicles = pd.read_pickle(pkl_path)
+
+    # Optional filtering
+    if lIdentifiers and sType:
+        # Convert to str and filter by regex OR expression
+        dfVehicles = dfVehicles.loc[
+            dfVehicles[sType].astype(str).str.contains("|".join(lIdentifiers), na=False)
+        ]
+
+    # Keep only active leading share classes
+    dfVehicles = dfVehicles.loc[dfVehicles.vehicle_status == "Active"]
+    dfVehicles = dfVehicles.loc[dfVehicles.is_leading_share_class == "Y"]
+
     return dfVehicles
 
+
 def split_eq_fi_sleeves(dfAllPortfolios, lPortfolioIDs=None):
+    """
+    Splits portfolios into Equity (EQ) and Fixed Income (FI) sleeves
+    and normalizes their weights within each sleeve.
+
+    Args:
+        dfAllPortfolios (pd.DataFrame): Input portfolio dataframe.
+        lPortfolioIDs (list, optional): List of portfolio IDs to split.
+                                        Defaults to lib_utils.EQ_FI_SPLIT_IDS.
+
+    Returns:
+        pd.DataFrame: Modified dataframe with EQ and FI sleeves.
+    """
     if lPortfolioIDs is None:
         lPortfolioIDs = lib_utils.EQ_FI_SPLIT_IDS
 
-    dfPortfolios = dfAllPortfolios.loc[dfAllPortfolios.portfolio_id.isin(lPortfolioIDs)]
-    # drop from input data
-    dfAllPortfolios = dfAllPortfolios.loc[~dfAllPortfolios.portfolio_id.isin(lPortfolioIDs)]
-    dfFI = dfPortfolios.loc[dfPortfolios.agi_instrument_asset_type_description == 'Debts']
-    dfEQ = dfPortfolios.loc[dfPortfolios.agi_instrument_asset_type_description == 'Equities']
-    
-    dfFI['wgt_sum'] = dfFI.groupby('portfolio_id')['weight'].transform('sum')
-    dfEQ['wgt_sum'] = dfEQ.groupby('portfolio_id')['weight'].transform('sum')
-    
-    dfFI['weight'] = dfFI['weight']/dfFI['wgt_sum']
-    dfEQ['weight'] = dfEQ['weight']/dfEQ['wgt_sum']
-    
-    dfFI['portfolio_id'] = dfFI['portfolio_id']*100
-    dfFI['portfolio_name'] = dfFI['portfolio_name'] + '_FI'
-    dfEQ['portfolio_id'] = dfEQ['portfolio_id']*10
-    dfEQ['portfolio_name'] = dfEQ['portfolio_name'] + '_EQ'    
-    
-    dfAllPortfolios = pd.concat([dfAllPortfolios,dfFI,dfEQ])
-    
+    # Extract portfolios to split
+    dfPortfolios = dfAllPortfolios.loc[dfAllPortfolios.portfolio_id.isin(lPortfolioIDs)].copy()
+    # Keep the rest as-is
+    dfAllPortfolios = dfAllPortfolios.loc[~dfAllPortfolios.portfolio_id.isin(lPortfolioIDs)].copy()
+
+    # Split into FI and EQ
+    dfFI = dfPortfolios.loc[dfPortfolios.agi_instrument_asset_type_description == "Debts"].copy()
+    dfEQ = dfPortfolios.loc[dfPortfolios.agi_instrument_asset_type_description == "Equities"].copy()
+
+    # Normalize weights within each sleeve
+    for df in [dfFI, dfEQ]:
+        df["wgt_sum"] = df.groupby("portfolio_id")["weight"].transform("sum")
+        df["weight"] = df["weight"] / df["wgt_sum"]
+        df.drop(columns="wgt_sum", inplace=True)
+
+    # Rename portfolio IDs and names for clarity
+    dfFI["portfolio_id"] = dfFI["portfolio_id"].astype(str) + "_FI"
+    dfFI["portfolio_name"] = dfFI["portfolio_name"] + "_FI"
+
+    dfEQ["portfolio_id"] = dfEQ["portfolio_id"].astype(str) + "_EQ"
+    dfEQ["portfolio_name"] = dfEQ["portfolio_name"] + "_EQ"
+
+    # Combine everything
+    dfAllPortfolios = pd.concat([dfAllPortfolios, dfFI, dfEQ], ignore_index=True)
+
     return dfAllPortfolios
 
-def get_pm_names(dfAllPortfolios):
-    
-    lPortfolioIDs = dfAllPortfolios.loc[dfAllPortfolios.portfolio_type.isin(['Fund','Portfolio'])]['portfolio_durable_key'].drop_duplicates()
-    
-    sql = """
-    SELECT * FROM """ + lib_utils.dictDremio['dfPortfolioManagerBridge'] + """ a 
-    left join """ + lib_utils.dictDremio['dfPortfolioManagerDim'] + """ b on a.portfolio_manager_durable_key = b.portfolio_manager_durable_key where a.is_current = True and b.is_current = True """
-    
-    dfPMs = pd.read_sql(sql,lib_utils.conndremio)
-    
-    lList = dfPMs.loc[dfPMs.portfolio_durable_key.isin(lPortfolioIDs)]['last_name'].drop_duplicates().to_list()
-    
-    return ';'.join(lList)
+
+def get_pm_names(dfAllPortfolios, return_list=False):
+    """
+    Get portfolio manager names for all Fund/Portfolio-type portfolios.
+
+    Args:
+        dfAllPortfolios (pd.DataFrame): Dataframe of portfolios.
+        return_list (bool, optional): If True, return a list instead of a semicolon-separated string. Default is False.
+
+    Returns:
+        str | list: Portfolio manager last names as string (joined by ;) or list.
+    """
+    # Get unique portfolio durable keys for funds/portfolios
+    lPortfolioIDs = (
+        dfAllPortfolios.loc[dfAllPortfolios.portfolio_type.isin(["Fund", "Portfolio"])]
+        ["portfolio_durable_key"]
+        .dropna()
+        .drop_duplicates()
+    )
+
+    if lPortfolioIDs.empty:
+        return [] if return_list else ""
+
+    # Query only needed columns
+    sql = f"""
+        SELECT a.portfolio_durable_key,
+               b.last_name,
+               b.first_name
+        FROM {lib_utils.dictDremio['dfPortfolioManagerBridge']} a
+        LEFT JOIN {lib_utils.dictDremio['dfPortfolioManagerDim']} b
+               ON a.portfolio_manager_durable_key = b.portfolio_manager_durable_key
+        WHERE a.is_current = True
+          AND b.is_current = True
+    """
+    dfPMs = pd.read_sql(sql, lib_utils.conndremio)
+
+    # Filter only relevant portfolios
+    lList = (
+        dfPMs.loc[dfPMs.portfolio_durable_key.isin(lPortfolioIDs), "last_name"]
+        .dropna()
+        .drop_duplicates()
+        .tolist()
+    )
+
+    return lList if return_list else ";".join(lList)
+
+
+def sanitize_filename(name):
+    """Replace invalid filename characters with underscores."""
+    return re.sub(r'[\\/*?:"<>|]', "_", name)
 
 def save_copies_with_sheetname_suffix(file_path):
+    """
+    Save each sheet of an Excel file as a separate file
+    with the sheet name appended to the base filename.
+    
+    Args:
+        file_path (str): Path to the original Excel file.
+    
+    Returns:
+        list[str]: List of saved file paths.
+    """
     # Load the workbook
     workbook = openpyxl.load_workbook(file_path)
     sheet_names = workbook.sheetnames
-    
-    # List to store the names of the saved files
+
+    # List to store saved file paths
     saved_files = []
-    
-    # Get the directory and base file name to construct new file names
+
+    # Get directory and base file name
     directory, base_name = os.path.split(file_path)
     base_name_no_ext = os.path.splitext(base_name)[0]
 
     for sheet_name in sheet_names:
-        # Create a new workbook for each sheet to save
+        # Create a new workbook
         new_workbook = Workbook()
-        new_workbook.remove(new_workbook.active)  # Remove the default sheet
-        
-        # Copy content from old sheet to new workbook
+        new_workbook.remove(new_workbook.active)
+
+        # Sanitize sheet name for file naming
+        safe_sheet_name = sanitize_filename(sheet_name)
+
+        # Copy sheet content with styles and formatting
         source = workbook[sheet_name]
         target = new_workbook.create_sheet(sheet_name)
-        for row in source:
+
+        for row in source.iter_rows():
             for cell in row:
-                target[cell.coordinate].value = cell.value
-        
+                new_cell = target[cell.coordinate]
+                new_cell.value = cell.value
+                if cell.has_style:
+                    new_cell._style = cell._style
+
+        # Copy column widths
+        for col_letter, col_dim in source.column_dimensions.items():
+            target.column_dimensions[col_letter].width = col_dim.width
+
+        # Copy row heights
+        for row_idx, row_dim in source.row_dimensions.items():
+            target.row_dimensions[row_idx].height = row_dim.height
+
+        # Copy merged cells
+        for merged_range in source.merged_cells.ranges:
+            target.merge_cells(str(merged_range))
+
         # Construct new file name
-        new_file_name = f"{base_name_no_ext}_{sheet_name}.xlsx"
+        new_file_name = f"{base_name_no_ext}_{safe_sheet_name}.xlsx"
         new_file_path = os.path.join(directory, new_file_name)
-        
+
         # Save the new workbook
         new_workbook.save(new_file_path)
         print(f"Saved {new_file_path}")
-        
-        # Append the new file name to the list
-        saved_files.append(f"{base_name_no_ext}_{sheet_name}")
-        
-    # Close the original workbook
+
+        saved_files.append(new_file_path)
+
     workbook.close()
-    
-    # Return the list of saved files
     return saved_files
     
-def compare_two_lists(dfPrev,dfCurrent,lIDs):
-    
-    dfCurrent                                   = dfCurrent.merge(dfPrev[lIDs],how='left',on=lIDs, indicator=True).rename(columns={'_merge': 'NEW_FLAG'})
-    dMap                                    = {
-                                                        'left_only':    'NEW',
-                                                        'right_only':   'REMOVED',
-                                                        'both':         ''
-                                                    }
-    dfCurrent['NEW_FLAG']                     = dfCurrent['NEW_FLAG'].map(dMap)
+def compare_two_lists(dfPrev, dfCurrent, lIDs, name_col="LONG_COMP_NAME"):
+    """
+    Compare two DataFrames and identify NEW and REMOVED rows based on IDs.
 
-    dfExits                                 = dfPrev[lIDs + ['LONG_COMP_NAME']].merge(dfCurrent.drop(['NEW_FLAG','LONG_COMP_NAME'],axis = 1),how = 'left',on=lIDs, indicator=True).rename(columns={'_merge': 'NEW_FLAG'})
-    #dfExits                                 = dfPrev[lIDs + ['ISSUER_NAME']].merge(dfCurrent.drop(['NEW_FLAG','ISSUER_NAME'],axis = 1),how = 'left',on=lIDs, indicator=True).rename(columns={'_merge': 'NEW_FLAG'})
+    Args:
+        dfPrev (pd.DataFrame): Previous snapshot of the dataset.
+        dfCurrent (pd.DataFrame): Current snapshot of the dataset.
+        lIDs (list[str]): List of column names to use as keys for comparison.
+        name_col (str): Optional descriptive column to include in exits (default: 'LONG_COMP_NAME').
 
-    dMap                                    = {
-                                                        'left_only':    'REMOVED',
-                                                        'right_only':   'NEW',
-                                                        'both':         ''
-                                                    }
-    dfExits['NEW_FLAG']                       = dfExits['NEW_FLAG'].map(dMap)
-                                                                               
-    dfAdditions                             = dfCurrent[dfCurrent['NEW_FLAG'] == 'NEW']
-    dfExits                                 = dfExits[dfExits['NEW_FLAG'] == 'REMOVED'][lIDs + ['LONG_COMP_NAME']]
-    #dfExits                                 = dfExits[dfExits['NEW_FLAG'] == 'REMOVED'][lIDs + ['ISSUER_NAME']]
-         
-    return dfCurrent.copy(),dfAdditions,dfExits
+    Returns:
+        tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+            - dfCurrentFlagged: Current DataFrame with NEW_FLAG column
+            - dfAdditions: Subset of new rows
+            - dfExits: Subset of removed rows (with IDs + name_col)
+    """
+    # --- Additions (what’s new in Current) ---
+    dfCurrentFlagged = dfCurrent.merge(
+        dfPrev[lIDs], how="left", on=lIDs, indicator=True
+    ).rename(columns={"_merge": "NEW_FLAG"})
 
-def extract_and_join(input_string):
-    # Find all substrings within <>
+    dfCurrentFlagged["NEW_FLAG"] = dfCurrentFlagged["NEW_FLAG"].map({
+        "left_only": "NEW",
+        "right_only": "REMOVED",  # should never happen here
+        "both": ""
+    })
+
+    # --- Exits (what’s missing compared to Prev) ---
+    dfExits = dfPrev[lIDs + [name_col]].merge(
+        dfCurrent.drop(columns=["NEW_FLAG"], errors="ignore"),
+        how="left", on=lIDs, indicator=True
+    ).rename(columns={"_merge": "NEW_FLAG"})
+
+    dfExits["NEW_FLAG"] = dfExits["NEW_FLAG"].map({
+        "left_only": "REMOVED",
+        "right_only": "NEW",  # should never happen here
+        "both": ""
+    })
+
+    # Keep only actual removals
+    dfExits = dfExits[dfExits["NEW_FLAG"] == "REMOVED"][lIDs + [name_col]]
+
+    # --- Subset of new rows ---
+    dfAdditions = dfCurrentFlagged[dfCurrentFlagged["NEW_FLAG"] == "NEW"]
+
+    return dfCurrentFlagged.copy(), dfAdditions, dfExits
+
+def extract_and_join(input_string: str) -> str | None:
+    """Extract substrings inside < > and join them with ';'."""
+    if pd.isna(input_string) or not isinstance(input_string, str):
+        return None
+
     matches = re.findall(r'<(.*?)>', input_string)
-    # Join the matches with ;
-    result = ';'.join(matches)
-    return result
+    matches = [m.strip() for m in matches if m.strip()]
+    return ';'.join(matches) if matches else None
 
-def compare_lists(list_a, list_b):
-    # Split the input strings into lists
-    list_a_split = list_a.split(';')
-    list_b_split = list_b.split(';')
+def compare_lists(list_a: str, list_b: str) -> str | None:
+    """Compare two semicolon-separated lists and return items only in list_a."""
+    if pd.isna(list_a) or not isinstance(list_a, str):
+        return None
+    if pd.isna(list_b) or not isinstance(list_b, str):
+        return list_a  # if list_b missing, everything in list_a is different
+
+    list_a_split = [x.strip() for x in list_a.split(';') if x.strip()]
+    list_b_split = [x.strip() for x in list_b.split(';') if x.strip()]
     
-    # Convert lists to sets and find the difference
     difference = set(list_a_split) - set(list_b_split)
-    
-    # Join the result with ;
-    result = ';'.join(difference)
-    return result
+    return ';'.join(sorted(difference)) if difference else None
+def calculate_ratios(df: pd.DataFrame, group_col: str, id_col: str, bool_columns: list[str]) -> pd.DataFrame:
+    """
+    Calculate ratios of unique IDs where boolean columns are True within each group.
 
-def calculate_ratios(df, group_col, id_col, bool_columns):
-    result = (
-        df.groupby(group_col)
-        .apply(lambda group: {
-            f"{col}_ratio": group[group[col]][id_col].nunique() / group[id_col].nunique()
+    Args:
+        df: Input dataframe.
+        group_col: Column to group by.
+        id_col: Identifier column for uniqueness.
+        bool_columns: List of boolean columns to compute ratios on.
+
+    Returns:
+        DataFrame with one row per group and ratio columns added.
+    """
+    def ratio_fn(group):
+        total_ids = group[id_col].nunique()
+        if total_ids == 0:
+            return {f"{col}_ratio": 0.0 for col in bool_columns}
+        return {
+            f"{col}_ratio": group.loc[group[col], id_col].nunique() / total_ids
             for col in bool_columns
-        })
-        .reset_index(name="ratios")
-    )
+        }
 
-    # Expand the dictionary into separate columns for readability
-    ratios_df = pd.DataFrame(result["ratios"].tolist())
+    result = df.groupby(group_col).apply(ratio_fn).reset_index(name="ratios")
+
+    # Expand the dictionary column into separate columns
+    ratios_df = pd.DataFrame(result["ratios"].tolist(), index=result.index)
     result = pd.concat([result[group_col], ratios_df], axis=1)
+
     return result
 
 def extract_max_year(expression):
-    if pd.isna(expression):
-        return None  # Handle NaN or None entries
-    # Ensure the expression is treated as a string
-    expression = str(expression)
-    # Use regular expression to find all years in the format 'FYYYYY' or 'YYYY'
-    years = re.findall(r'FY(\d{4})|(\d{4})', expression)
-    if not years:
-        return None  # or some default value, e.g., float('nan')
-    # Flatten the list of tuples and filter out None values
-    years = [float(year) for match in years for year in match if year]
-    # Return the maximum year as float
-    return max(years)
+    """
+    Extract the maximum year from a string containing 'FYxxxx' or 'xxxx'.
 
+    Args:
+        expression: str, numeric, or NaN.
+
+    Returns:
+        float: maximum year found, or np.nan if none.
+    """
+    if pd.isna(expression):
+        return np.nan
+
+    expression = str(expression)
+
+    # Find all 4-digit year numbers, with or without 'FY' prefix
+    matches = re.findall(r'(?:FY)?(\d{4})', expression)
+
+    if not matches:
+        return np.nan
+
+    years = [float(y) for y in matches]
+    return max(years)
 
 # Columns shared across all holding loaders
 def _ensure_columns(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
@@ -2583,25 +3265,14 @@ def _assign_region(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def load_holdings(
-    source: str,
-    *args,
-    columns: Sequence[str] = lib_utils.HOLDING_COLUMNS,
-    **kwargs,
-):
-    """Unified loader for holdings data from multiple sources."""
-
+def load_holdings(source: str, *args, columns: Sequence[str] = lib_utils.HOLDING_COLUMNS, **kwargs):
     try:
-        loader_name = lib_utils.HOLDINGS_LOADERS[source.lower()]
+        loader = lib_utils.HOLDINGS_LOADERS[source.lower()]
     except KeyError as exc:
-        raise ValueError(f"Unknown data source: {source}") from exc
-    loader = getattr(sys.modules[__name__], loader_name, None)
-    if loader is None:
-        raise ValueError(f"Loader function {loader_name} is not defined")
+        raise ValueError(f"Unknown data source: {source!r}") from exc
 
     result = loader(*args, **kwargs)
     if isinstance(result, tuple):
         df = _standardize_holdings(result[0], columns)
         return (df,) + result[1:]
-    else:
-        return _standardize_holdings(result, columns)
+    return _standardize_holdings(result, columns)

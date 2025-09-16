@@ -217,8 +217,24 @@ sPathNameData               = str(Path(os.getcwd()).home()).replace("\\", "/") +
 # sharepoint
 sWorkFolder                 = sPathNameGeneral + '15. Investment process/Impact Assessment/'
 sTargetFundsFolder          = sPathNameGeneral + '15. Investment process/PAI Consideration for Multi Asset FoF/'
-sBenchmarkFolder            = sPathNameGeneral + '15. Investment process/Universes/'  
+sBenchmarkFolder            = sPathNameGeneral + '15. Investment process/Universes/'
 sExclusionsFolder           = sPathNameGeneral + '2. Exclusion/3 BAU Process/1 Exclusion Lists/2023 November/0. ISS Export/'
+
+CACHE_VOLUME_BASE_PATH = "dbfs:/Volumes/zenith_dev_gold/esg_impact_analysis/cache_volume/"
+TARGET_FUNDS_CACHE_PARQUET = f"{CACHE_VOLUME_BASE_PATH}dfExt.parquet"
+COUNTRY_CACHE_PATH = f"{CACHE_VOLUME_BASE_PATH}dfCountries.parquet"
+CEDAR_CACHE_PATH = f"{CACHE_VOLUME_BASE_PATH}dfCEDAR.parquet"
+TARGET_FUNDS_CACHE_PICKLE = os.path.join(sTargetFundsFolder, "dfExt.pkl")
+
+UNIVERSES_FOLDER = Path(sBenchmarkFolder)
+IMPACT_ASSESSMENT_SUBPATH = Path("15. Investment process") / "Impact Assessment"
+DERIVATIVES_SUBPATH = Path("15. Investment process") / "Derivatives"
+DERIVATIVES_LIST_FILENAME = "Derivatives_List.xlsx"
+MANUAL_MAPPING_FILENAME = "Manual_Mapping.xlsx"
+NZAS_SOV_FILENAME = "NZAS sov_2024 11.xlsx"
+TRUCOST_SOVEREIGN_FILENAME = "Trucost sovereign dataset.xlsx"
+
+DEFAULT_IDS_FUND_IDS = (40002847, 40011162, 40002955, 40002956)
 
 
 # unity catalog

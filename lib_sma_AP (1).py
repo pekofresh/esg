@@ -8,6 +8,7 @@ import logging
 import os
 import pickle
 import re
+
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,6 +29,7 @@ pd.set_option("display.max_columns", 500)
 pd.set_option("display.width", 1000)
 
 T = TypeVar("T")
+
 
 
 # =============================================================================
@@ -217,7 +219,6 @@ def load_cache(path: str, spark: SparkSession, format: str = "parquet") -> pd.Da
 # Refinitiv holdings loaders
 # =============================================================================
 
-
 def _read_refinitiv_file(file_path: str) -> pd.DataFrame:
     """Load a single Refinitiv CSV file and keep valid holdings only.
 
@@ -226,6 +227,7 @@ def _read_refinitiv_file(file_path: str) -> pd.DataFrame:
 
     Returns:
         DataFrame containing only ``Allocation_Type == 'FLHLD'`` rows.
+
 
     Raises:
         FileNotFoundError: If ``file_path`` does not exist.
@@ -258,6 +260,7 @@ def _load_refinitiv(
 
     Returns:
         Holdings DataFrame enriched with security master data.
+
 
     Raises:
         EnvironmentError: If ``data_dir`` cannot be resolved.
@@ -343,6 +346,7 @@ def _load_refinitiv(
 # =============================================================================
 # SQL helpers
 # =============================================================================
+
 def build_named_in_clause(values: Sequence[Any], prefix: str = "param") -> tuple[str, dict[str, Any]]:
     """Build a SQL ``IN`` clause using named bind parameters.
 
@@ -603,6 +607,7 @@ def build_country_sql(country_dim_table: str) -> str:
         Select statement that fetches all country rows.
     """
 
+
     return f"SELECT * FROM {country_dim_table}"
 
 
@@ -821,6 +826,7 @@ def calc_universe_Oktagon(sDate: List[str], iExport: bool = True) -> pd.DataFram
     Returns:
         Universe DataFrame for the Oktagon mandate.
     """
+
 
     return calc_universe(
         name="Oktagon",
@@ -1362,12 +1368,14 @@ def _kpi(df: pd.DataFrame) -> pd.DataFrame:
 def _sus(df: pd.DataFrame) -> pd.DataFrame:
     """Add binary helper columns for sustainable investment shares.
 
+
     Args:
         df: Sustainable investment dataset.
 
     Returns:
         DataFrame with boolean helper columns for SIS thresholds.
     """
+
 
     mastered = df.copy()
     mastered["non_zero_sustainable_investment_share_environmental_post_dnsh"] = (
@@ -2004,6 +2012,7 @@ def calc_weighted_average_esg_new(
 # =============================================================================
 
 
+
 def _prepare_esg_data(
     dfESG: pd.DataFrame,
     sRightOn: str,
@@ -2183,6 +2192,7 @@ def merge_esg_data_new(
 # =============================================================================
 # Derived ESG helper columns
 # =============================================================================
+
 
 
 def calc_new_variables(dfPortfolios: pd.DataFrame) -> pd.DataFrame:
@@ -2413,6 +2423,7 @@ def load_portfolio_benchmark_bridge(
 # =============================================================================
 # Holdings loaders
 # =============================================================================
+
 
 def _load_dremio_holdings(
     lPortfolioIDs: Sequence[Union[int, str]],
@@ -3058,6 +3069,7 @@ def calc_corp_eligible_univ(dfPortfolio: pd.DataFrame, iLookthrough: bool = Fals
 # =============================================================================
 
 
+
 def item_positions(lItems: Sequence[Any], lList: Sequence[Any]) -> list[int]:
     """Return the positions of items from ``lItems`` within ``lList``.
 
@@ -3099,6 +3111,7 @@ def excel_export(writer: pd.ExcelWriter, exports: Sequence[dict[str, Any]]) -> N
         writer: Open Excel writer (context handled externally).
         exports: Sequence of configuration dictionaries with keys ``data`` (DataFrame),
             ``sSheetName`` (str) and optional formatting lists.
+
 
     Returns:
         None.
@@ -3599,6 +3612,7 @@ def get_pm_names(dfAllPortfolios, return_list=False):
 # =============================================================================
 # File utilities
 # =============================================================================
+
 
 
 def sanitize_filename(name: str) -> str:

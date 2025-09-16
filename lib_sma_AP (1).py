@@ -8,6 +8,7 @@ import logging
 import os
 import pickle
 import re
+
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -28,6 +29,7 @@ pd.set_option("display.max_columns", 500)
 pd.set_option("display.width", 1000)
 
 T = TypeVar("T")
+
 
 
 # =============================================================================
@@ -113,6 +115,7 @@ logger.setLevel(logging.INFO)
 
 
 def _log_timing(func: Callable[..., T]) -> Callable[..., T]:
+
     """Decorate a callable to log its execution time.
 
     Args:
@@ -218,6 +221,80 @@ def _load_cache(path: str, spark: SparkSession, format: str = "parquet") -> pd.D
 # =============================================================================
 
 
+def save_cache(
+    df_pandas: pd.DataFrame,
+    path: str,
+    spark: SparkSession,
+    format: str = "parquet",
+) -> None:
+    """Persist a pandas DataFrame to Parquet (Spark) or pickle.
+
+    Args:
+        df_pandas: Data to persist.
+        path: Target location on DBFS or the local filesystem.
+        spark: Active Spark session required for Parquet writes.
+        format: Storage format – ``"parquet"`` (default) or ``"pickle"``.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If an unsupported ``format`` is provided.
+    """
+
+    storage_format = format.lower()
+    if storage_format == "parquet":
+        df_spark = spark.createDataFrame(df_pandas)
+        for column_name, dtype in df_spark.dtypes:
+            if dtype.lower() == "void":
+                logger.warning(
+                    "Casting VOID column %s to StringType for Parquet compatibility",
+                    column_name,
+                )
+                df_spark = df_spark.withColumn(
+                    column_name, df_spark[column_name].cast(StringType())
+                )
+        df_spark.write.mode("overwrite").parquet(path)
+    elif storage_format == "pickle":
+        if path.startswith("dbfs:/"):
+            path = "/dbfs/" + path[6:]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df_pandas.to_pickle(path)
+    else:
+        raise ValueError("Invalid format. Supported formats: 'parquet', 'pickle'.")
+
+
+
+def load_cache(path: str, spark: SparkSession, format: str = "parquet") -> pd.DataFrame:
+    """Load a cached DataFrame from Parquet or pickle.
+
+    Args:
+        path: Source path in DBFS or on the local filesystem.
+        spark: Active Spark session used for reading Parquet data.
+        format: Storage format – ``"parquet"`` (default) or ``"pickle"``.
+
+    Returns:
+        DataFrame loaded from the cache.
+
+    Raises:
+        ValueError: If an unsupported ``format`` is requested.
+    """
+
+    storage_format = format.lower()
+    if storage_format == "parquet":
+        return spark.read.parquet(path).toPandas()
+    if storage_format == "pickle":
+        if path.startswith("dbfs:/"):
+            path = "/dbfs/" + path[6:]
+        return pd.read_pickle(path)
+
+    raise ValueError("Invalid format. Supported formats: 'parquet', 'pickle'.")
+
+
+# =============================================================================
+# Refinitiv holdings loaders
+# =============================================================================
+
 def _read_refinitiv_file(file_path: str) -> pd.DataFrame:
     """Load a single Refinitiv CSV file and keep valid holdings only.
 
@@ -226,6 +303,7 @@ def _read_refinitiv_file(file_path: str) -> pd.DataFrame:
 
     Returns:
         DataFrame containing only ``Allocation_Type == 'FLHLD'`` rows.
+
 
     Raises:
         FileNotFoundError: If ``file_path`` does not exist.
@@ -258,6 +336,7 @@ def _load_refinitiv(
 
     Returns:
         Holdings DataFrame enriched with security master data.
+
 
     Raises:
         EnvironmentError: If ``data_dir`` cannot be resolved.
@@ -344,6 +423,7 @@ def _load_refinitiv(
 # SQL helpers
 # =============================================================================
 def _build_named_in_clause(values: Sequence[Any], prefix: str = "param") -> tuple[str, dict[str, Any]]:
+
     """Build a SQL ``IN`` clause using named bind parameters.
 
     Args:
@@ -371,6 +451,7 @@ def _build_named_in_clause(values: Sequence[Any], prefix: str = "param") -> tupl
 
 
 def _format_in_clause(values: Union[Iterable[Any], int, str]) -> str:
+
     """Return a literal SQL ``IN`` clause fragment.
 
     Args:
@@ -400,6 +481,7 @@ def _format_in_clause(values: Union[Iterable[Any], int, str]) -> str:
 
 
 def _build_ids_portfolio_sql(
+
     ids_holdings_table: str,
     ids_fund_table: str,
     dates: Sequence[str],
@@ -418,6 +500,7 @@ def _build_ids_portfolio_sql(
     """
     date_clause, date_params = _build_named_in_clause(dates, prefix="date")
     fund_clause, fund_params = _build_named_in_clause(fund_ids, prefix="fund")
+
 
     sql = f"""
         SELECT a.edm_fund_id AS portfolio_id,
@@ -445,6 +528,7 @@ def _build_ids_portfolio_sql(
 # DataFrame enrichments & normalizers
 # =============================================================================
 def _normalize_company_ids(df: pd.DataFrame) -> pd.DataFrame:
+
     """Ensure Bloomberg company identifiers are stored as floats.
 
     Args:
@@ -463,6 +547,7 @@ def _normalize_company_ids(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _enrich_with_securities(
+
     df: pd.DataFrame,
     df_securities: pd.DataFrame,
     join_key: str,
@@ -488,6 +573,7 @@ def _enrich_with_securities(
 
 
 def _enrich_with_countries(df: pd.DataFrame, df_country: pd.DataFrame) -> pd.DataFrame:
+
     """Join country reference metadata to holdings.
 
     Args:
@@ -510,6 +596,7 @@ def _enrich_with_countries(df: pd.DataFrame, df_country: pd.DataFrame) -> pd.Dat
 
 
 def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+
     """Populate canonical descriptive columns if present.
 
     Args:
@@ -527,6 +614,7 @@ def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     if "INDUSTRY_SECTOR" in result:
         result["gics_sector_description"] = result["INDUSTRY_SECTOR"].str.upper()
 
+
     return result
 
 
@@ -534,6 +622,7 @@ def _standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
 # IDS portfolio loader
 # =============================================================================
 def _load_ids_portfolio(
+
     dates: Sequence[str],
     join_key: str,
     conn: Connection,
@@ -594,6 +683,7 @@ def _load_ids_portfolio(
 
 
 def _build_country_sql(country_dim_table: str) -> str:
+
     """Return the SQL query used to load the country dimension table.
 
     Args:
@@ -602,6 +692,7 @@ def _build_country_sql(country_dim_table: str) -> str:
     Returns:
         Select statement that fetches all country rows.
     """
+
 
     return f"SELECT * FROM {country_dim_table}"
 
@@ -644,6 +735,7 @@ def load_cntry(
 
 @_log_timing
 def _build_cedar_sql(portfolio_dim_table: str) -> str:
+
     """Return the SQL query that retrieves active CEDAR portfolios.
 
     Args:
@@ -734,6 +826,7 @@ def search_cedar(
 
 
 def _calc_universe(
+
     name: str,
     sDate: List[str],
     loader: str,                  # "holdings" or "sql"
@@ -812,6 +905,7 @@ def _calc_universe(
 # =============================================================================
 
 def _calc_universe_Oktagon(sDate: List[str], iExport: bool = True) -> pd.DataFrame:
+
     """Create the Oktagon universe for the provided dates.
 
     Args:
@@ -823,6 +917,7 @@ def _calc_universe_Oktagon(sDate: List[str], iExport: bool = True) -> pd.DataFra
     """
 
     return _calc_universe(
+
         name="Oktagon",
         sDate=sDate,
         loader="holdings",
@@ -836,6 +931,7 @@ def _calc_universe_Oktagon(sDate: List[str], iExport: bool = True) -> pd.DataFra
 
 
 def _calc_universe_Unicredit(sDate: List[str], iExport: bool = True) -> pd.DataFrame:
+
     """Create the Unicredit universe and apply median cut-offs.
 
     Args:
@@ -847,6 +943,7 @@ def _calc_universe_Unicredit(sDate: List[str], iExport: bool = True) -> pd.DataF
     """
 
     return _calc_universe(
+
         name="Unicredit",
         sDate=sDate,
         loader="sql",
@@ -859,6 +956,7 @@ def _calc_universe_Unicredit(sDate: List[str], iExport: bool = True) -> pd.DataF
         export_path=(
             str(lib_utils.UNIVERSES_FOLDER / f"Unicredit_{sDate[0]}.xlsx") if iExport else None
         ),
+
     )
 
 
@@ -874,6 +972,7 @@ def calc_universe_Best_Styles_PSR(sDate: List[str], iExport: bool = True) -> pd.
     """
 
     return _calc_universe(
+
         name="PSR",
         sDate=sDate,
         loader="sql",
@@ -888,6 +987,7 @@ def calc_universe_Best_Styles_PSR(sDate: List[str], iExport: bool = True) -> pd.
         export_path=(
             str(lib_utils.UNIVERSES_FOLDER / f"PSR_{sDate[0]}.xlsx") if iExport else None
         ),
+
     )
 
 def load_sec_hierarchy(
@@ -1165,6 +1265,7 @@ def _categorize_market_cap(
 MASTERING_TRANSFORMERS: Dict[str, Callable[[pd.DataFrame], pd.DataFrame]] = {}
 
 def _register_mastering(name: str) -> Callable[[Callable[[pd.DataFrame], pd.DataFrame]], Callable[[pd.DataFrame], pd.DataFrame]]:
+
     """Register a mastering transformer under the provided dataset name.
 
     Args:
@@ -1195,6 +1296,7 @@ def _susmin(df: pd.DataFrame) -> pd.DataFrame:
         Filtered DataFrame.
     """
 
+
     return df.loc[df.id_exl_list == 3].copy()
 
 
@@ -1215,6 +1317,7 @@ def _susmin_enh(df: pd.DataFrame) -> pd.DataFrame:
 @_register_mastering("dfTowardsSustainability")
 def _towards(df: pd.DataFrame) -> pd.DataFrame:
     """Keep entries relevant for the Towards Sustainability labels.
+
 
     Args:
         df: Towards Sustainability dataset.
@@ -1237,6 +1340,7 @@ def _febelfin(df: pd.DataFrame) -> pd.DataFrame:
         Filtered DataFrame.
     """
 
+
     return df.loc[df.id_exl_list == 6].copy()
 
 
@@ -1257,6 +1361,7 @@ def _firmwide(df: pd.DataFrame) -> pd.DataFrame:
 @_register_mastering("dfFH")
 def _fh(df: pd.DataFrame) -> pd.DataFrame:
     """Master Firm House data to binary indicators for 2024 edition.
+
 
     Args:
         df: Firm House dataset.
@@ -1337,6 +1442,7 @@ def _msci(df: pd.DataFrame) -> pd.DataFrame:
     mastered["market_cap_sector"] = mastered["market_cap_sector"].astype(str).replace({"nan": "_OTHER"})
     mastered["market_cap_category"] = mastered["issuer_market_cap_usd"].apply(
         lambda value: _categorize_market_cap(value) if pd.notnull(value) else None
+
     )
     return mastered
 
@@ -1360,6 +1466,7 @@ def _kpi(df: pd.DataFrame) -> pd.DataFrame:
     mastered["evic_usd"] = mastered["evic_eur"].astype(float) * 1.17 * 1_000_000
     mastered["evic_category"] = mastered["evic_usd"].apply(
         lambda value: _categorize_market_cap(value) if pd.notnull(value) else None
+
     )
     return mastered
 
@@ -1368,12 +1475,14 @@ def _kpi(df: pd.DataFrame) -> pd.DataFrame:
 def _sus(df: pd.DataFrame) -> pd.DataFrame:
     """Add binary helper columns for sustainable investment shares.
 
+
     Args:
         df: Sustainable investment dataset.
 
     Returns:
         DataFrame with boolean helper columns for SIS thresholds.
     """
+
 
     mastered = df.copy()
     mastered["non_zero_sustainable_investment_share_environmental_post_dnsh"] = (
@@ -1396,6 +1505,7 @@ def _sus(df: pd.DataFrame) -> pd.DataFrame:
     mastered["SIS_issuer_binary_below_05"] = (
         mastered["sustainable_investment_share_post_dnsh"] < 0.05
     )
+
     return mastered
 
 
@@ -1456,6 +1566,7 @@ def _kpisov(df: pd.DataFrame) -> pd.DataFrame:
     trucost = pd.read_excel(
         Path(lib_utils.sWorkFolder) / lib_utils.TRUCOST_SOVEREIGN_FILENAME
     )
+
     trucost["Scopes 1 + 2 + 3 (in mn tCO2)"] = trucost[
         ["Scopes 1 + 2 (in mn tCO2)", "Scope 3 (in mn tCO2)"]
     ].sum(axis=1)
@@ -1498,6 +1609,7 @@ def _sbti(df: pd.DataFrame) -> pd.DataFrame:
 
     mastered = df.copy()
     mastered["near_term_target_year"] = mastered["near_term_target_year"].apply(_extract_max_year)
+
     mastered["short_term_targets_2025"] = (
         (mastered["near_term_target_status"] == "Targets Set")
         & (mastered["near_term_target_year"] == 2025)
@@ -1530,6 +1642,7 @@ def _nzagg(df: pd.DataFrame) -> pd.DataFrame:
 
     nzsov = pd.read_excel(
         Path(lib_utils.sWorkFolder) / lib_utils.NZAS_SOV_FILENAME,
+
         sheet_name="NZAS Sov",
     )
     nzsov = nzsov.drop_duplicates(subset=["id_bb_company"]).dropna(subset=["id_bb_company"])
@@ -1552,6 +1665,7 @@ def _nzagg(df: pd.DataFrame) -> pd.DataFrame:
 # =============================================================================
 
 def _dremio_mastering(dataset: str, df: pd.DataFrame) -> pd.DataFrame:
+
     """Apply the mastering transformer registered for the dataset.
 
     Args:
@@ -2201,6 +2315,7 @@ def merge_esg_data_new(
 # =============================================================================
 
 
+
 def calc_new_variables(dfPortfolios: pd.DataFrame) -> pd.DataFrame:
     """Add convenience ESG comparison columns to the portfolio DataFrame.
 
@@ -2384,6 +2499,7 @@ def _calc_waterfall(
 
 
 def _load_portfolio_benchmark_bridge(
+
     lPortfolioID: List[int],
     con=lib_utils.conndremio,
     dictDremio: dict = lib_utils.dictDremio,
@@ -2430,6 +2546,7 @@ def _load_portfolio_benchmark_bridge(
 # Holdings loaders
 # =============================================================================
 
+
 def _load_dremio_holdings(
     lPortfolioIDs: Sequence[Union[int, str]],
     sDate: Sequence[str],
@@ -2452,6 +2569,7 @@ def _load_dremio_holdings(
     """
     ids_clause = _format_in_clause(lPortfolioIDs)
     dates_clause = _format_in_clause(sDate)
+
 
     query = f"""
     SELECT
@@ -2634,6 +2752,7 @@ def _load_benchmark_holdings(
     ids_clause = _format_in_clause(ids)
     dates_clause = _format_in_clause(sDate)
 
+
     query = f"""
     SELECT
         CAST(d.full_date AS DATE) AS effective_date,
@@ -2752,6 +2871,7 @@ def _load_index_holdings(
     """
     ids_clause = _format_in_clause(ids)
     dates_clause = _format_in_clause(sDate)
+
 
     query = f"""
     SELECT
@@ -3075,6 +3195,7 @@ def calc_corp_eligible_univ(dfPortfolio: pd.DataFrame, iLookthrough: bool = Fals
 
 
 def _item_positions(lItems: Sequence[Any], lList: Sequence[Any]) -> list[int]:
+
     """Return the positions of items from ``lItems`` within ``lList``.
 
     Args:
@@ -3088,6 +3209,7 @@ def _item_positions(lItems: Sequence[Any], lList: Sequence[Any]) -> list[int]:
     return [i for i, val in enumerate(lList) if val in lItems]
 
 def _strip_tz_from_object_cols(df: pd.DataFrame) -> pd.DataFrame:
+
     """Remove timezone info from datetime-like columns (object or tz-aware).
 
     Args:
@@ -3115,6 +3237,7 @@ def excel_export(writer: pd.ExcelWriter, exports: Sequence[dict[str, Any]]) -> N
         writer: Open Excel writer (context handled externally).
         exports: Sequence of configuration dictionaries with keys ``data`` (DataFrame),
             ``sSheetName`` (str) and optional formatting lists.
+
 
     Returns:
         None.
@@ -3207,6 +3330,7 @@ def calc_decimal(df: pd.DataFrame, lColNames: Sequence[str]) -> pd.DataFrame:
     return df
 
 def _mylambda(x: pd.DataFrame, lVar: Sequence[str]) -> pd.Series:
+
     """Aggregate weighted averages, weight sums, and unique issuer count.
 
     Args:
@@ -3476,6 +3600,7 @@ def get_names(dfPortfolios, max_api=100):
     return dfPortfolios
 
 
+
 # =============================================================================
 # Portfolio search utilities
 # =============================================================================
@@ -3618,6 +3743,7 @@ def _get_pm_names(dfAllPortfolios, return_list=False):
 
 
 def _sanitize_filename(name: str) -> str:
+
     """Replace invalid filename characters with underscores.
 
     Args:
@@ -3702,6 +3828,7 @@ def _save_copies_with_sheetname_suffix(file_path):
 
 
 def _compare_two_lists(dfPrev, dfCurrent, lIDs, name_col="LONG_COMP_NAME"):
+
     """
     Compare two DataFrames and identify NEW and REMOVED rows based on IDs.
 
@@ -3749,6 +3876,7 @@ def _compare_two_lists(dfPrev, dfCurrent, lIDs, name_col="LONG_COMP_NAME"):
     return dfCurrentFlagged.copy(), dfAdditions, dfExits
 
 def _extract_and_join(input_string: str) -> str | None:
+
     """Extract substrings inside angle brackets and join them with semicolons.
 
     Args:
@@ -3767,6 +3895,7 @@ def _extract_and_join(input_string: str) -> str | None:
 
 
 def _compare_lists(list_a: str, list_b: str) -> str | None:
+
     """Return items present in ``list_a`` but absent in ``list_b``.
 
     Args:

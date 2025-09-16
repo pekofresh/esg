@@ -5,11 +5,10 @@ from __future__ import annotations
 
 import json
 import logging
-import math
 import os
 import pickle
 import re
-import sys
+
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -18,28 +17,24 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar, Union
 
 import numpy as np
+import openpyxl
 import pandas as pd
+from openpyxl import Workbook
+from pyspark.sql import SparkSession
+from pyspark.sql.types import StringType
+
+import lib_utils_AP as lib_utils
 
 pd.set_option("display.max_columns", 500)
 pd.set_option("display.width", 1000)
 
-# import matplotlib.pyplot as plt
-import openpyxl
-from openpyxl import Workbook
-from pyspark.sql import SparkSession
-from pyspark.sql.types import StringType
-from statsmodels.distributions.empirical_distribution import ECDF
-
-# import blpapi
-# import pdblp
-import lib_utils_AP as lib_utils
-
 T = TypeVar("T")
 
 
-# ---------------------------------------------------------------------------
+
+# =============================================================================
 # Configuration and logging
-# ---------------------------------------------------------------------------
+# =============================================================================
 
 
 @dataclass
@@ -145,6 +140,85 @@ def log_timing(func: Callable[..., T]) -> Callable[..., T]:
     return wrapper
 
 
+# =============================================================================
+# Cache utilities
+# =============================================================================
+
+
+def save_cache(
+    df_pandas: pd.DataFrame,
+    path: str,
+    spark: SparkSession,
+    format: str = "parquet",
+) -> None:
+    """Persist a pandas DataFrame to Parquet (Spark) or pickle.
+
+    Args:
+        df_pandas: Data to persist.
+        path: Target location on DBFS or the local filesystem.
+        spark: Active Spark session required for Parquet writes.
+        format: Storage format – ``"parquet"`` (default) or ``"pickle"``.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If an unsupported ``format`` is provided.
+    """
+
+    storage_format = format.lower()
+    if storage_format == "parquet":
+        df_spark = spark.createDataFrame(df_pandas)
+        for column_name, dtype in df_spark.dtypes:
+            if dtype.lower() == "void":
+                logger.warning(
+                    "Casting VOID column %s to StringType for Parquet compatibility",
+                    column_name,
+                )
+                df_spark = df_spark.withColumn(
+                    column_name, df_spark[column_name].cast(StringType())
+                )
+        df_spark.write.mode("overwrite").parquet(path)
+    elif storage_format == "pickle":
+        if path.startswith("dbfs:/"):
+            path = "/dbfs/" + path[6:]
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        df_pandas.to_pickle(path)
+    else:
+        raise ValueError("Invalid format. Supported formats: 'parquet', 'pickle'.")
+
+
+
+def load_cache(path: str, spark: SparkSession, format: str = "parquet") -> pd.DataFrame:
+    """Load a cached DataFrame from Parquet or pickle.
+
+    Args:
+        path: Source path in DBFS or on the local filesystem.
+        spark: Active Spark session used for reading Parquet data.
+        format: Storage format – ``"parquet"`` (default) or ``"pickle"``.
+
+    Returns:
+        DataFrame loaded from the cache.
+
+    Raises:
+        ValueError: If an unsupported ``format`` is requested.
+    """
+
+    storage_format = format.lower()
+    if storage_format == "parquet":
+        return spark.read.parquet(path).toPandas()
+    if storage_format == "pickle":
+        if path.startswith("dbfs:/"):
+            path = "/dbfs/" + path[6:]
+        return pd.read_pickle(path)
+
+    raise ValueError("Invalid format. Supported formats: 'parquet', 'pickle'.")
+
+
+# =============================================================================
+# Refinitiv holdings loaders
+# =============================================================================
+
 def _read_refinitiv_file(file_path: str) -> pd.DataFrame:
     """Load a single Refinitiv CSV file and keep valid holdings only.
 
@@ -153,6 +227,7 @@ def _read_refinitiv_file(file_path: str) -> pd.DataFrame:
 
     Returns:
         DataFrame containing only ``Allocation_Type == 'FLHLD'`` rows.
+
 
     Raises:
         FileNotFoundError: If ``file_path`` does not exist.
@@ -166,7 +241,6 @@ def _read_refinitiv_file(file_path: str) -> pd.DataFrame:
     return df.loc[df.Allocation_Type == "FLHLD"].copy()
 
 
-# load master data
 @log_timing
 def _load_refinitiv(
     refresh: bool,
@@ -186,6 +260,7 @@ def _load_refinitiv(
 
     Returns:
         Holdings DataFrame enriched with security master data.
+
 
     Raises:
         EnvironmentError: If ``data_dir`` cannot be resolved.
@@ -268,9 +343,10 @@ def _load_refinitiv(
     return df_out
 
 @log_timing
-# -----------------------------------------------------------------------------
+# =============================================================================
 # SQL helpers
-# -----------------------------------------------------------------------------
+# =============================================================================
+
 def build_named_in_clause(values: Sequence[Any], prefix: str = "param") -> tuple[str, dict[str, Any]]:
     """Build a SQL ``IN`` clause using named bind parameters.
 
@@ -296,6 +372,35 @@ def build_named_in_clause(values: Sequence[Any], prefix: str = "param") -> tuple
         params[key] = value
 
     return f"({', '.join(clause_parts)})", params
+
+
+def format_in_clause(values: Union[Iterable[Any], int, str]) -> str:
+    """Return a literal SQL ``IN`` clause fragment.
+
+    Args:
+        values: Iterable or scalar with the desired filter values.
+
+    Returns:
+        A SQL fragment such as ``('A', 'B')`` or ``(1, 2)``.
+    """
+
+    if not isinstance(values, (list, tuple, set)):
+        values = [values]
+
+    formatted_values: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            formatted_values.append(str(int(value)))
+        else:
+            escaped = str(value).replace("'", "''")
+            formatted_values.append(f"'{escaped}'")
+
+    if not formatted_values:
+        return "(NULL)"
+
+    return f"({', '.join(formatted_values)})"
 
 
 def build_ids_portfolio_sql(
@@ -340,9 +445,9 @@ def build_ids_portfolio_sql(
     return sql, params
 
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # DataFrame enrichments & normalizers
-# -----------------------------------------------------------------------------
+# =============================================================================
 def normalize_company_ids(df: pd.DataFrame) -> pd.DataFrame:
     """Ensure Bloomberg company identifiers are stored as floats.
 
@@ -429,9 +534,9 @@ def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-# -----------------------------------------------------------------------------
-# Main loader
-# -----------------------------------------------------------------------------
+# =============================================================================
+# IDS portfolio loader
+# =============================================================================
 def load_ids_portfolio(
     dates: Sequence[str],
     join_key: str,
@@ -492,73 +597,6 @@ def load_ids_portfolio(
     return df
 
 
-def save_cache(
-    df_pandas: pd.DataFrame,
-    path: str,
-    spark: SparkSession,
-    format: str = "parquet",
-) -> None:
-    """Persist a pandas DataFrame to Parquet (Spark) or pickle.
-
-    Args:
-        df_pandas: Data to persist.
-        path: Target location on DBFS or the local filesystem.
-        spark: Active Spark session required for Parquet writes.
-        format: Storage format – ``"parquet"`` (default) or ``"pickle"``.
-
-    Returns:
-        None.
-
-    Raises:
-        ValueError: If an unsupported ``format`` is provided.
-    """
-
-    storage_format = format.lower()
-    if storage_format == "parquet":
-        df_spark = spark.createDataFrame(df_pandas)
-        for column_name, dtype in df_spark.dtypes:
-            if dtype.lower() == "void":
-                logger.warning(
-                    "Casting VOID column %s to StringType for Parquet compatibility",
-                    column_name,
-                )
-                df_spark = df_spark.withColumn(
-                    column_name, df_spark[column_name].cast(StringType())
-                )
-        df_spark.write.mode("overwrite").parquet(path)
-    elif storage_format == "pickle":
-        if path.startswith("dbfs:/"):
-            path = "/dbfs/" + path[6:]
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        df_pandas.to_pickle(path)
-    else:
-        raise ValueError("Invalid format. Supported formats: 'parquet', 'pickle'.")
-
-def load_cache(path: str, spark: SparkSession, format: str = "parquet") -> pd.DataFrame:
-    """Load a cached DataFrame from Parquet or pickle.
-
-    Args:
-        path: Source path in DBFS or on the local filesystem.
-        spark: Active Spark session used for reading Parquet data.
-        format: Storage format – ``"parquet"`` (default) or ``"pickle"``.
-
-    Returns:
-        DataFrame loaded from the cache.
-
-    Raises:
-        ValueError: If an unsupported ``format`` is requested.
-    """
-
-    storage_format = format.lower()
-    if storage_format == "parquet":
-        return spark.read.parquet(path).toPandas()
-    if storage_format == "pickle":
-        if path.startswith("dbfs:/"):
-            path = "/dbfs/" + path[6:]
-        return pd.read_pickle(path)
-
-    raise ValueError("Invalid format. Supported formats: 'parquet', 'pickle'.")
-
 def build_country_sql(country_dim_table: str) -> str:
     """Return the SQL query used to load the country dimension table.
 
@@ -568,6 +606,7 @@ def build_country_sql(country_dim_table: str) -> str:
     Returns:
         Select statement that fetches all country rows.
     """
+
 
     return f"SELECT * FROM {country_dim_table}"
 
@@ -692,6 +731,13 @@ def search_cedar(
             "esg_categorization",
         ]
     ]
+
+
+# =============================================================================
+# Universe builders
+# =============================================================================
+
+
 def calc_universe(
     name: str,
     sDate: List[str],
@@ -766,9 +812,9 @@ def calc_universe(
 
 
 
-# -----------------------------------------------------------------------------------
-# convenience wrappers for each universe
-# -----------------------------------------------------------------------------------
+# =============================================================================
+# Convenience universe wrappers
+# =============================================================================
 
 def calc_universe_Oktagon(sDate: List[str], iExport: bool = True) -> pd.DataFrame:
     """Create the Oktagon universe for the provided dates.
@@ -780,6 +826,7 @@ def calc_universe_Oktagon(sDate: List[str], iExport: bool = True) -> pd.DataFram
     Returns:
         Universe DataFrame for the Oktagon mandate.
     """
+
 
     return calc_universe(
         name="Oktagon",
@@ -987,7 +1034,11 @@ def load_green_bonds(
 
     return df
 
-# load ESG data
+# =============================================================================
+# ESG data loaders
+# =============================================================================
+
+
 def load_c4f_data(
     filename: str,
     base_path: str,
@@ -1129,9 +1180,9 @@ def register_mastering(name: str) -> Callable[[Callable[[pd.DataFrame], pd.DataF
 
     return wrapper
 
-# -----------------------------------------------------------------------------
+# =============================================================================
 # Dataset-specific transformers
-# -----------------------------------------------------------------------------
+# =============================================================================
 
 @register_mastering("dfSusMinExclusions")
 def _susmin(df: pd.DataFrame) -> pd.DataFrame:
@@ -1317,12 +1368,14 @@ def _kpi(df: pd.DataFrame) -> pd.DataFrame:
 def _sus(df: pd.DataFrame) -> pd.DataFrame:
     """Add binary helper columns for sustainable investment shares.
 
+
     Args:
         df: Sustainable investment dataset.
 
     Returns:
         DataFrame with boolean helper columns for SIS thresholds.
     """
+
 
     mastered = df.copy()
     mastered["non_zero_sustainable_investment_share_environmental_post_dnsh"] = (
@@ -1494,9 +1547,9 @@ def _nzagg(df: pd.DataFrame) -> pd.DataFrame:
     return df_out
 
 
-# -----------------------------------------------------------------------------
-# Dispatcher
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Mastering dispatcher
+# =============================================================================
 
 def dremio_mastering(dataset: str, df: pd.DataFrame) -> pd.DataFrame:
     """Apply the mastering transformer registered for the dataset.
@@ -1516,7 +1569,11 @@ def dremio_mastering(dataset: str, df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError(f"No mastering rules registered for dataset {dataset}")
     return MASTERING_TRANSFORMERS[dataset](df)
 
-# dbx
+# =============================================================================
+# Dremio data access helpers
+# =============================================================================
+
+
 def _infer_date_col(df: pd.DataFrame, fallback: str) -> str:
     """Infer the most appropriate effective-date column.
 
@@ -1646,6 +1703,12 @@ def load_dremio_data(
 
     save_cache(df, cache_path, lib_utils.spark, format="parquet")
     return df
+
+
+# =============================================================================
+# Underlying and weighting utilities
+# =============================================================================
+
 
 def _normalize_weights(df: pd.DataFrame, group_col: str, weight_col: str = "weight") -> pd.DataFrame:
     """Normalize weights so they sum to one within each group.
@@ -1787,6 +1850,12 @@ def calc_coverage(
         )
 
     return df_out
+
+
+# =============================================================================
+# Weighted ESG calculations
+# =============================================================================
+
 
 def _apply_lookthrough(
     df: pd.DataFrame,
@@ -1936,7 +2005,13 @@ def calc_weighted_average_esg_new(
         raise NotImplementedError("Equal-weight logic not yet migrated from legacy block.")
 
     return dfOutAgg, dfOut, dfPortfolio
-   
+
+
+# =============================================================================
+# ESG merge utilities
+# =============================================================================
+
+
 
 def _prepare_esg_data(
     dfESG: pd.DataFrame,
@@ -2114,6 +2189,12 @@ def merge_esg_data_new(
     return dfOut
 
 
+# =============================================================================
+# Derived ESG helper columns
+# =============================================================================
+
+
+
 def calc_new_variables(dfPortfolios: pd.DataFrame) -> pd.DataFrame:
     """Add convenience ESG comparison columns to the portfolio DataFrame.
 
@@ -2289,7 +2370,13 @@ def calc_waterfall(
     dfOut = dfOut.drop(columns=temp_cols[1:])  # keep the final "ID_BB_COMPANY_suffix"
 
     return dfOut
-# load holdings
+
+
+# =============================================================================
+# Legacy holdings utilities
+# =============================================================================
+
+
 def load_portfolio_benchmark_bridge(
     lPortfolioID: List[int],
     con=lib_utils.conndremio,
@@ -2333,54 +2420,10 @@ def load_portfolio_benchmark_bridge(
 
     return df
 
-# -----------------------------
-# Small helpers
-# -----------------------------
+# =============================================================================
+# Holdings loaders
+# =============================================================================
 
-def format_in_clause(values: Union[Iterable[Any], int, str]) -> str:
-    """Return a literal SQL ``IN`` clause fragment.
-
-    Args:
-        values: Iterable or scalar with the desired filter values.
-
-    Returns:
-        A SQL fragment such as ``('A', 'B')`` or ``(1, 2)``.
-    """
-
-    if not isinstance(values, (list, tuple, set)):
-        values = [values]
-
-    formatted_values: list[str] = []
-    for value in values:
-        if value is None:
-            continue
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
-            formatted_values.append(str(int(value)))
-        else:
-            escaped = str(value).replace("'", "''")
-            formatted_values.append(f"'{escaped}'")
-
-    if not formatted_values:
-        return "(NULL)"
-
-    return f"({', '.join(formatted_values)})"
-
-
-# You provided this in another snippet; assumed available:
-# def load_portfolio_benchmark_bridge(lPortfolioID): ...
-
-# You also referenced these objects from lib_utils:
-# - lib_utils.conndremio (DB connection)
-# - lib_utils.dictDremio (table map)
-# - lib_utils.dfHierarchy (BBG company hierarchy)
-# - lib_utils.dfCountry, lib_utils.dfSecurities (for XLS enrichment)
-# - lib_utils.EQ_FI_SPLIT_IDS (config for sleeve splitting)
-# - split_eq_fi_sleeves(...) (function), assumed available
-
-
-# -----------------------------
-# Holdings (portfolios)
-# -----------------------------
 
 def _load_dremio_holdings(
     lPortfolioIDs: Sequence[Union[int, str]],
@@ -2563,9 +2606,9 @@ def _load_dremio_holdings(
     return dfHoldings
 
 
-# -----------------------------
-# Benchmarks
-# -----------------------------
+# =============================================================================
+# Benchmark holdings loader
+# =============================================================================
 
 def _load_benchmark_holdings(
     ids: Union[int, Sequence[int]],
@@ -2682,9 +2725,9 @@ def _load_benchmark_holdings(
     return dfBMKHoldings
 
 
-# -----------------------------
-# Indexes
-# -----------------------------
+# =============================================================================
+# Index holdings loader
+# =============================================================================
 
 def _load_index_holdings(
     ids: Sequence[int],
@@ -2808,9 +2851,9 @@ def _load_index_holdings(
     return dfIdx
 
 
-# -----------------------------
-# Custom XLS portfolios
-# -----------------------------
+# =============================================================================
+# Custom XLS portfolio loader
+# =============================================================================
 
 def _load_xls_portfolio(
     lDatnames: Sequence[str],
@@ -3020,6 +3063,13 @@ def calc_corp_eligible_univ(dfPortfolio: pd.DataFrame, iLookthrough: bool = Fals
 
     return df, dfClassification, lSovTypes
 
+
+# =============================================================================
+# DataFrame utilities and exports
+# =============================================================================
+
+
+
 def item_positions(lItems: Sequence[Any], lList: Sequence[Any]) -> list[int]:
     """Return the positions of items from ``lItems`` within ``lList``.
 
@@ -3061,6 +3111,7 @@ def excel_export(writer: pd.ExcelWriter, exports: Sequence[dict[str, Any]]) -> N
         writer: Open Excel writer (context handled externally).
         exports: Sequence of configuration dictionaries with keys ``data`` (DataFrame),
             ``sSheetName`` (str) and optional formatting lists.
+
 
     Returns:
         None.
@@ -3421,7 +3472,11 @@ def get_names(dfPortfolios, max_api=100):
 
     return dfPortfolios
 
-import os
+
+# =============================================================================
+# Portfolio search utilities
+# =============================================================================
+
 
 def search_cedar_vehicles(iRefresh, lIdentifiers=None, sType=None):
     """
@@ -3554,6 +3609,12 @@ def get_pm_names(dfAllPortfolios, return_list=False):
     return lList if return_list else ";".join(lList)
 
 
+# =============================================================================
+# File utilities
+# =============================================================================
+
+
+
 def sanitize_filename(name: str) -> str:
     """Replace invalid filename characters with underscores.
 
@@ -3631,7 +3692,13 @@ def save_copies_with_sheetname_suffix(file_path):
 
     workbook.close()
     return saved_files
-    
+
+
+# =============================================================================
+# Comparison helpers
+# =============================================================================
+
+
 def compare_two_lists(dfPrev, dfCurrent, lIDs, name_col="LONG_COMP_NAME"):
     """
     Compare two DataFrames and identify NEW and REMOVED rows based on IDs.
@@ -3772,7 +3839,12 @@ def extract_max_year(expression):
     years = [float(y) for y in matches]
     return max(years)
 
-# Columns shared across all holding loaders
+
+# =============================================================================
+# Holdings normalisation helpers
+# =============================================================================
+
+
 def _ensure_columns(df: pd.DataFrame, columns: Sequence[str]) -> pd.DataFrame:
     """Ensure all required columns exist in ``df``.
 

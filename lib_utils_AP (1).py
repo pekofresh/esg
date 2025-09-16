@@ -148,6 +148,12 @@ for col in HOLDING_COLUMNS:
     HOLDING_DEFAULTS.setdefault(col, "NA")
     HOLDING_DTYPES.setdefault(col, "object")
 
+HOLDINGS_LOADERS = {
+    "dremio": _load_dremio_holdings,
+    "benchmark": _load_benchmark_holdings,
+    "index": _load_index_holdings,
+    "xls": _load_xls_portfolio,
+}
 
 def apply_column_mappings(
     df: pd.DataFrame,
